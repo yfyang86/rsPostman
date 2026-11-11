@@ -1,6 +1,9 @@
 [workspace]
 resolver = "2"
-members = ["crates/core", "crates/cli", "crates/server"]
+members = ["crates/core", "crates/cli", "crates/server", "crates/desktop"]
+# The desktop shell needs the platform webview libraries (see README), so it is built on request:
+#   cargo build -p rspostman-desktop
+default-members = ["crates/core", "crates/cli", "crates/server"]
 
 [workspace.package]
 version = "0.1.0"

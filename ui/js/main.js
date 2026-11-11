@@ -39,8 +39,8 @@ function renderEnvbar() {
     h("button.icon-btn", { title: "Edit active environment", "aria-label": "Edit active environment", testid: "env-edit", onClick: () => {
       if (state.activeEnv) openEnvironment(state.activeEnv);
       else { state.side = "environments"; renderSidebar(); }
-    } }, "✎"),
-    h("button.icon-btn", { title: "Toggle light / dark theme", "aria-label": "Toggle theme", testid: "theme-toggle", onClick: () => applyTheme(document.documentElement.dataset.theme === "dark" ? "light" : "dark") }, "◐"));
+    } }, h("span", { html: '<svg width="15" height="15" viewBox="0 0 16 16" aria-hidden="true"><path d="M11.5 2.2l2.3 2.3-8 8-3 .7.7-3z" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linejoin="round"/></svg>' })),
+    h("button.icon-btn", { title: "Toggle light / dark theme", "aria-label": "Toggle theme", testid: "theme-toggle", onClick: () => applyTheme(document.documentElement.dataset.theme === "dark" ? "light" : "dark") }, h("span", { html: '<svg width="16" height="16" viewBox="0 0 16 16" aria-hidden="true"><circle cx="8" cy="8" r="6.2" fill="none" stroke="currentColor" stroke-width="1.5"/><path d="M8 1.8a6.2 6.2 0 0 1 0 12.4z" fill="currentColor"/></svg>' })));
 }
 
 // ---------------------------------------------------------------- sidebar
@@ -406,7 +406,13 @@ function renderStatus() {
     h("span", `${state.collections.length} collection${state.collections.length === 1 ? "" : "s"}`));
 }
 
-on("collections", () => { renderSidebar(); renderStatus(); });
+on("collections", () => {
+  renderSidebar();
+  renderStatus();
+  // tool pages (runner, mock servers) list collections: keep the visible one current
+  const t = activeTab();
+  if (t && ["runner", "mock"].includes(t.kind) && t.onShow) t.onShow();
+});
 on("environments", () => { renderEnvbar(); renderStatus(); if (state.side === "environments") renderSidebar(); });
 on("history", () => { if (state.side === "history") renderSidebar(); });
 on("tabs", () => { renderTabbar(); renderWorkspace(); if (state.side === "collections") renderSidebar(); });

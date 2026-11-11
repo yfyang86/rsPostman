@@ -4,3 +4,4 @@ e2e/test-results/
 e2e/playwright-report/
 *.log
 .DS_Store
+crates/desktop/gen/

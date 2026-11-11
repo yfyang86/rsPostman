@@ -1,0 +1,19 @@
+[package]
+name = "rspostman-desktop"
+description = "rsPostman desktop application (Tauri shell around the local web UI)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "rspostman-desktop"
+path = "src/main.rs"
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2", features = [] }
+rspostman-core = { path = "../core" }
+rspostman-server = { path = "../server" }
+anyhow.workspace = true

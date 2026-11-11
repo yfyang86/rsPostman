@@ -1,4 +1,5 @@
 // Performance tools: LLM provider profiler and request/collection benchmark.
+import { helpButton } from "./help.js";
 import { api } from "./api.js";
 import { state, views, tools, openSingleton, collectionById } from "./state.js";
 import { h, clear, toast, guard, kvEditor, cleanRows, humanSize, humanTime, statusClass, secretInput, isReference } from "./util.js";
@@ -134,7 +135,7 @@ views.profile = (tab) => {
   tab.onClose = () => { if (timer) clearInterval(timer); };
   drawForm();
   drawResults();
-  return h("div.page", { testid: "profile" }, h("h2", "Profile LLM provider"), h("div.sub", "Evaluate the streaming performance and health of an OpenAI-compatible LLM endpoint."), form, results);
+  return h("div.page", { testid: "profile" }, h("h2", "Profile LLM provider", helpButton("profile-an-llm-provider")), h("div.sub", "Evaluate the streaming performance and health of an OpenAI-compatible LLM endpoint."), form, results);
 };
 
 tools.push({ id: "profile", label: "Profile LLM", icon: "✦", title: "Profile an LLM provider (streaming health, TTFT, token rate)", action: () => openSingleton("profile", { name: "Profile LLM" }) });
@@ -372,7 +373,7 @@ views.benchmark = (tab) => {
   if (!cfg.collectionId && state.collections[0]) cfg.collectionId = state.collections[0].info._postman_id;
   drawForm();
   drawResults();
-  return h("div.page", { testid: "benchmark" }, h("h2", "Benchmark"), h("div.sub", "Measure latency percentiles, time to first byte and throughput of an endpoint or of every request in a collection."), form, results);
+  return h("div.page", { testid: "benchmark" }, h("h2", "Benchmark", helpButton("benchmark")), h("div.sub", "Measure latency percentiles, time to first byte and throughput of an endpoint or of every request in a collection."), form, results);
 };
 
 tools.push({ id: "benchmark", label: "Benchmark", icon: "⏱", title: "Benchmark an endpoint or collection (percentiles, throughput, thresholds)", action: () => openSingleton("benchmark", { name: "Benchmark" }) });

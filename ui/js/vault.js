@@ -1,5 +1,6 @@
 // Local vault: secrets encrypted at rest, unlocked with a master passphrase and used as
 // {{vault:name}}. Values are write-only here – the backend never sends one back.
+import { helpButton } from "./help.js";
 import { api } from "./api.js";
 import { state, views, emit, openSingleton } from "./state.js";
 import { h, clear, toast, guard, confirmDialog, copyText, secretInput } from "./util.js";
@@ -118,6 +119,6 @@ views.vault = (tab) => {
     }
   };
   draw();
-  return h("div.page", { testid: "vault" }, h("h2", "Vault"),
+  return h("div.page", { testid: "vault" }, h("h2", "Vault", helpButton("vault-and-credentials")),
     h("div.sub", "Encrypted storage for credentials. Vault secrets are resolved only when a request is sent and never appear in the history, reports or scripts."), body);
 };

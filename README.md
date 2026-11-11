@@ -21,6 +21,15 @@ examples/        sample collection and data file
 Sprints/         development log: plan, test report and retrospective per sprint
 ```
 
+## Documentation
+
+* **[User manual](docs/user-manual.md)** – every screen and command, with screenshots. The same
+  manual is built into the application: press **F1** or the **?** button (Help Center).
+* [Scripting reference](docs/SCRIPTING.md) – the `pm.*` API for pre-request and test scripts.
+* `Sprints/` – development log.
+
+![rsPostman](ui/help/img/overview.png)
+
 ## Build and run
 
 ```bash
@@ -143,6 +152,7 @@ independent users would experience, and at high rates the client itself becomes 
 | Monitors | `rspostman monitor` runs a collection on an interval and appends results to a JSON-lines log |
 | Import / export | Postman Collection v2.0/v2.1, Postman environments/globals, OpenAPI 3, Swagger 2 (JSON/YAML), HAR, curl; export Postman v2.1 |
 | Code generation | curl, raw HTTP, HTTPie, Wget, Python, JavaScript fetch, Node axios, Go, Rust, Java OkHttp, C#, PHP, Ruby, PowerShell |
+| Help | Built-in Help Center (F1): the user manual and scripting reference with screenshots, topic navigation, search and per-page help buttons; works offline |
 | Other | History, persistent cookie jar + manager, WebSocket client, API documentation generator (Markdown/HTML), light and dark theme |
 
 ### Not implemented

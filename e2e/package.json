@@ -1,0 +1,11 @@
+{
+  "name": "rspostman-e2e",
+  "private": true,
+  "description": "Playwright end-to-end tests for the rsPostman GUI",
+  "scripts": {
+    "test": "playwright test"
+  },
+  "devDependencies": {
+    "@playwright/test": "^1.48.0"
+  }
+}

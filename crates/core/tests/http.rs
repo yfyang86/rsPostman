@@ -18,7 +18,6 @@ fn scopes(base: &str) -> Scopes {
     let mut sc = Scopes::default();
     sc.environment.insert("base".into(), base.into());
     sc.environment.insert("who".into(), "wörld & co".into());
-    // tiny_http (the echo server) only accepts ASCII header values
     sc.environment.insert("ascii".into(), "plain value".into());
     sc
 }
@@ -31,6 +30,7 @@ fn query_path_variables_and_headers() {
     req.url.variable[0].value = "a b".into();
     req.url.query.push(KV { key: "off".into(), value: "1".into(), disabled: true, ..Default::default() });
     req.header.push(KV::new("X-Who", "{{ascii}}"));
+    req.header.push(KV::new("X-Utf8", "{{who}}"));
     req.header.push(KV { key: "X-Off".into(), value: "1".into(), disabled: true, ..Default::default() });
     let r = send(&req, None, &sc);
     assert_eq!(r.status, 200);
@@ -38,6 +38,7 @@ fn query_path_variables_and_headers() {
     assert_eq!(j["path"], "/anything/a b/x");
     assert_eq!(j["args"], json!({"greet": "wörld & co", "plain": "1"}));
     assert_eq!(j["headers"]["x-who"], "plain value");
+    assert_eq!(j["headers"]["x-utf8"], "wörld & co");
     assert!(j["headers"].get("x-off").is_none());
     assert!(j["headers"]["user-agent"].as_str().unwrap().starts_with("rsPostman/"));
     assert!(r.is_text() && r.size > 0);

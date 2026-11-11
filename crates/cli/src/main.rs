@@ -240,8 +240,9 @@ enum Cmd {
         #[arg(short, long)]
         verbose: bool,
     },
-    /// Benchmark a request or every request of a collection: latency percentiles P10/P50/P90/P95/P99,
-    /// requests per second, throughput and error counts. Scripts are not run; connections are reused
+    /// Benchmark a request or every request of a collection: latency percentiles, time to first
+    /// byte, requests per second, status codes and errors. Can run for a fixed time, at a fixed
+    /// rate, check thresholds and compare with a baseline. Scripts are not run
     #[command(alias = "bench")]
     Benchmark {
         /// Ad-hoc request: `[METHOD] URL`
@@ -261,24 +262,52 @@ enum Cmd {
         /// Environment (name, id or exported file); default: the active environment
         #[arg(short, long)]
         env: Option<String>,
-        /// Iterations of each request (default: 10)
-        #[arg(short = 'n', long, default_value_t = 10)]
+        /// Iterations of each request
+        #[arg(short = 'n', long, default_value_t = 10, conflicts_with = "duration")]
         iterations: usize,
+        /// Run for a fixed time instead of a number of iterations, e.g. `30s`, `2m`, `500ms`
+        #[arg(short = 't', long, value_name = "TIME")]
+        duration: Option<String>,
         /// Number of concurrent workers (at most 256)
         #[arg(short = 'c', long, default_value_t = 1)]
         concurrency: usize,
-        /// Delay between requests in milliseconds
-        #[arg(long, default_value_t = 0, value_name = "MS")]
+        /// Target request rate in requests per second (all workers together)
+        #[arg(long, value_name = "RPS")]
+        rate: Option<f64>,
+        /// Delay between the requests of each worker, in milliseconds
+        #[arg(long, default_value_t = 0, value_name = "MS", conflicts_with = "rate")]
         delay: u64,
+        /// Unmeasured warm-up rounds before the measurement starts
+        #[arg(long, default_value_t = 0, value_name = "N")]
+        warmup: usize,
+        /// Open a new connection for every request instead of reusing connections
+        #[arg(long)]
+        no_keepalive: bool,
+        /// Pass/fail condition, repeatable: `p95<200ms`, `error_rate<=1%`, `rps>=50`, `ttfb_p99<1s` …
+        /// With thresholds the exit code follows them
+        #[arg(long = "assert", value_name = "CONDITION")]
+        asserts: Vec<String>,
+        /// Compare with a JSON report of an earlier run; exit 1 when this run is worse
+        #[arg(long, value_name = "FILE")]
+        compare: Option<PathBuf>,
+        /// Allowed slow-down (latency) or drop (requests/s) against the baseline, in percent
+        #[arg(long, default_value_t = 10.0, value_name = "PERCENT")]
+        tolerance: f64,
         /// Skip TLS certificate verification
         #[arg(short = 'k', long)]
         insecure: bool,
         /// Request timeout in milliseconds
         #[arg(long, value_name = "MS")]
         timeout: Option<u64>,
-        /// Write a JSON report
+        /// Write a JSON report (usable later as a --compare baseline)
         #[arg(long, value_name = "FILE")]
         report_json: Option<PathBuf>,
+        /// Write every sample as CSV
+        #[arg(long, value_name = "FILE")]
+        report_csv: Option<PathBuf>,
+        /// Write a standalone HTML report with charts
+        #[arg(long, value_name = "FILE")]
+        report_html: Option<PathBuf>,
         /// Only print the summary
         #[arg(long)]
         quiet: bool,
@@ -1006,14 +1035,39 @@ fn fmt_ms(x: f64) -> String {
     }
 }
 
-fn print_bench_summary(r: &rspostman_core::profile::BenchReport) {
+/// `30s`, `2m`, `500ms`, `1h` -> milliseconds.
+fn parse_duration_ms(s: &str) -> Result<u64> {
+    let t = s.trim().to_lowercase();
+    let (num, unit) = t.split_at(t.find(|c: char| !(c.is_ascii_digit() || c == '.')).unwrap_or(t.len()));
+    let n: f64 = num.parse().map_err(|_| anyhow!("invalid duration `{s}` (examples: 30s, 2m, 500ms)"))?;
+    let ms = match unit {
+        "ms" => n,
+        "" | "s" => n * 1000.0,
+        "m" => n * 60_000.0,
+        "h" => n * 3_600_000.0,
+        _ => bail!("invalid duration unit in `{s}` (use ms, s, m or h)"),
+    };
+    if ms < 1.0 {
+        bail!("the duration must be at least 1 ms");
+    }
+    Ok(ms as u64)
+}
+
+fn stats_cells(s: &rspostman_core::profile::LatencyStats) -> Vec<String> {
+    [s.min, s.p10, s.p50, s.p75, s.p90, s.p95, s.p99, s.p999, s.max, s.mean].iter().map(|v| fmt_ms(*v)).collect()
+}
+
+fn print_bench_summary(r: &rspostman_core::bench::BenchReport, comparison: Option<&rspostman_core::bench::Comparison>) {
     use rspostman_core::http::{human_size, human_time};
     println!();
     match &r.overall {
-        Some(s) => out::table(
-            &["LATENCY (ms)", "MIN", "P10", "P50", "P90", "P95", "P99", "MAX", "MEAN"],
-            &[vec!["all requests".into(), fmt_ms(s.min), fmt_ms(s.p10), fmt_ms(s.p50), fmt_ms(s.p90), fmt_ms(s.p95), fmt_ms(s.p99), fmt_ms(s.max), fmt_ms(s.mean)]],
-        ),
+        Some(s) => {
+            let mut rows = vec![[vec!["total".to_string()], stats_cells(s)].concat()];
+            if let Some(t) = &r.ttfb {
+                rows.push([vec!["first byte".to_string()], stats_cells(t)].concat());
+            }
+            out::table(&["LATENCY (ms)", "MIN", "P10", "P50", "P75", "P90", "P95", "P99", "P99.9", "MAX", "MEAN"], &rows);
+        }
         None => println!("{}", out::red("no request was answered")),
     }
     if r.by_name.len() > 1 {
@@ -1025,7 +1079,7 @@ fn print_bench_summary(r: &rspostman_core::profile::BenchReport) {
                 vec![
                     n.name.clone(),
                     n.requests.to_string(),
-                    n.errors.to_string(),
+                    (n.errors + n.http_errors).to_string(),
                     s.map(|s| fmt_ms(s.p50)).unwrap_or_else(|| "-".into()),
                     s.map(|s| fmt_ms(s.p90)).unwrap_or_else(|| "-".into()),
                     s.map(|s| fmt_ms(s.p99)).unwrap_or_else(|| "-".into()),
@@ -1034,19 +1088,65 @@ fn print_bench_summary(r: &rspostman_core::profile::BenchReport) {
             })
             .collect();
         println!();
-        out::table(&["REQUEST", "OK", "ERRORS", "P50", "P90", "P99", "MEAN"], &rows);
+        out::table(&["REQUEST", "ANSWERED", "FAILED", "P50", "P90", "P99", "MEAN"], &rows);
     }
+    if !r.histogram.is_empty() {
+        println!("\n{}", out::bold("DISTRIBUTION (ms)"));
+        let max = r.histogram.iter().map(|b| b.count).max().unwrap_or(1).max(1);
+        let labels: Vec<String> = r
+            .histogram
+            .iter()
+            .map(|b| match (b.from_ms, b.to_ms) {
+                (_, None) => format!("> {}", b.from_ms),
+                (0, Some(t)) => format!("<= {t}"),
+                (f, Some(t)) => format!("{f} - {t}"),
+            })
+            .collect();
+        let width = labels.iter().map(|l| l.len()).max().unwrap_or(0);
+        for (b, label) in r.histogram.iter().zip(&labels) {
+            let bar = "#".repeat(((b.count * 40) as f64 / max as f64).ceil() as usize);
+            println!("  {label:>width$}  {} {}", out::cyan(&bar), b.count);
+        }
+    }
+    let codes: Vec<String> = r.status_counts.iter().map(|(code, n)| format!("{code} × {n}")).collect();
     println!(
-        "\n{} requests in {} · {:.2} req/s · {} received · {} failed to connect · {} answered with HTTP 4xx/5xx",
+        "\n{} requests in {} · {:.2} req/s · {} received · {} failed to connect · {} answered with HTTP 4xx/5xx ({:.2}% errors)",
         r.total_requests,
         human_time(r.duration_ms),
         r.rps(),
         human_size(r.bytes),
         r.errors,
-        r.http_errors
+        r.http_errors,
+        r.error_rate
     );
+    if !codes.is_empty() {
+        println!("status codes: {}", codes.join(", "));
+    }
+    if r.warmup_requests > 0 {
+        println!("{}", out::dim(&format!("{} warm-up request(s) were sent first and are not included", r.warmup_requests)));
+    }
     if let Some(a) = &r.aborted {
         println!("{}", out::yellow(a));
+    }
+    if !r.thresholds.is_empty() {
+        println!("\n{}", out::bold("THRESHOLDS"));
+        for t in &r.thresholds {
+            let actual = match (&t.actual, &t.note) {
+                (Some(a), _) => format!("measured {a:.2}"),
+                (None, Some(n)) => n.clone(),
+                _ => String::new(),
+            };
+            println!("  {} {}  {}", if t.passed { out::green("✓") } else { out::red("✗") }, t.expr, out::dim(&actual));
+        }
+    }
+    if let Some(c) = comparison {
+        println!("\n{}", out::bold(&format!("COMPARED WITH THE BASELINE (tolerance {}%)", c.tolerance_pct)));
+        let rows: Vec<Vec<String>> = c
+            .rows
+            .iter()
+            .map(|row| vec![row.metric.clone(), format!("{:.2}", row.baseline), format!("{:.2}", row.current), format!("{:+.1}%", row.change_pct), if row.regression { "REGRESSION".into() } else { "ok".into() }])
+            .collect();
+        out::table(&["METRIC", "BASELINE", "THIS RUN", "CHANGE", ""], &rows);
     }
 }
 
@@ -1728,7 +1828,9 @@ fn run(cli: Cli) -> Result<i32> {
             }
             Ok(if summary.success() { 0 } else { 1 })
         }
-        Cmd::Benchmark { collection, request, folder, target, req, env, iterations, concurrency, delay, insecure, timeout, report_json, quiet } => {
+        Cmd::Benchmark {
+            collection, request, folder, target, req, env, iterations, duration, concurrency, rate, delay, warmup, no_keepalive, asserts, compare, tolerance, insecure, timeout, report_json, report_csv, report_html, quiet,
+        } => {
             use rspostman_core::profile;
             let mut session = load_session(&ws, None, env.as_deref())?;
             let mut tasks: Vec<profile::BenchTask> = vec![];
@@ -1768,8 +1870,9 @@ fn run(cli: Cli) -> Result<i32> {
                     tasks.push(profile::BenchTask { name: format!("{} {}", prepared.method, rspostman_core::secrets::redact_url(&prepared.url)), prepared });
                 }
             }
-            if concurrency > profile::MAX_CONCURRENCY {
-                eprintln!("{}", out::yellow(&format!("concurrency limited to {}", profile::MAX_CONCURRENCY)));
+            use rspostman_core::bench;
+            if concurrency > bench::MAX_CONCURRENCY {
+                eprintln!("{}", out::yellow(&format!("concurrency limited to {}", bench::MAX_CONCURRENCY)));
             }
             if insecure {
                 session.settings.verify_ssl = false;
@@ -1777,28 +1880,82 @@ fn run(cli: Cli) -> Result<i32> {
             if let Some(t) = timeout {
                 session.settings.timeout_ms = t;
             }
+            // fail on bad input before any request is sent
+            bench::validate_thresholds(&asserts)?;
+            if let Some(r) = rate {
+                if !(r.is_finite() && r > 0.0) {
+                    bail!("--rate must be a positive number of requests per second");
+                }
+            }
+            let baseline: Option<bench::BenchReport> = match &compare {
+                Some(p) => Some(
+                    serde_json::from_str(&std::fs::read_to_string(p).with_context(|| format!("cannot read baseline {}", p.display()))?)
+                        .with_context(|| format!("{} is not a benchmark JSON report", p.display()))?,
+                ),
+                None => None,
+            };
+            let opts = bench::BenchOptions {
+                iterations,
+                duration_ms: match &duration {
+                    Some(d) => Some(parse_duration_ms(d)?),
+                    None => None,
+                },
+                concurrency,
+                delay_ms: delay,
+                rate,
+                warmup,
+                keep_alive: !no_keepalive,
+                thresholds: asserts,
+            };
             if !quiet {
                 let names: Vec<&str> = tasks.iter().map(|t| t.name.as_str()).collect();
-                eprintln!("{} {}", out::bold("Benchmark"), out::dim(&format!("{} · {} iteration(s) · {} worker(s)", names.join(", "), iterations, concurrency.max(1))));
+                let shape = match opts.duration_ms {
+                    Some(ms) => format!("for {}", rspostman_core::http::human_time(ms)),
+                    None => format!("{iterations} iteration(s)"),
+                };
+                let rate_note = opts.rate.map(|r| format!(" · {r} req/s")).unwrap_or_default();
+                eprintln!("{} {}", out::bold("Benchmark"), out::dim(&format!("{} · {shape} · {} worker(s){rate_note}", names.join(", "), concurrency.clamp(1, bench::MAX_CONCURRENCY))));
             }
+            // short runs list every request; long ones report progress once a second
+            let list_each = !quiet && opts.duration_ms.is_none() && tasks.len() * iterations <= 60;
             let count = std::sync::atomic::AtomicUsize::new(0);
-            let on_sample = |s: &profile::BenchSample| {
+            let failed = std::sync::atomic::AtomicUsize::new(0);
+            let last = std::sync::Mutex::new(std::time::Instant::now());
+            let on_sample = |s: &bench::BenchSample| {
                 let n = count.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+                if s.failed() {
+                    failed.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                }
                 if quiet {
                     return;
                 }
-                match &s.error {
-                    Some(e) => eprintln!("  {} {}  {}", out::red("✗"), out::bold(&s.name), out::red(e)),
-                    None => eprintln!("  {} {}  {} {}", out::dim(&format!("#{n}")), out::bold(&s.name), out::status(s.status, ""), out::dim(&rspostman_core::http::human_time(s.time_ms))),
+                if list_each {
+                    match &s.error {
+                        Some(e) => eprintln!("  {} {}  {}", out::red("✗"), out::bold(&s.name), out::red(e)),
+                        None => eprintln!("  {} {}  {} {}", out::dim(&format!("#{n}")), out::bold(&s.name), out::status(s.status, ""), out::dim(&rspostman_core::http::human_time(s.time_ms))),
+                    }
+                } else if let Ok(mut at) = last.lock() {
+                    if at.elapsed() >= std::time::Duration::from_secs(1) {
+                        *at = std::time::Instant::now();
+                        eprintln!("  {}", out::dim(&format!("{n} requests, {} failed", failed.load(std::sync::atomic::Ordering::SeqCst))));
+                    }
                 }
             };
-            let report = profile::benchmark(&tasks, &session.settings, iterations, delay, concurrency, None, &on_sample);
-            print_bench_summary(&report);
-            if let Some(p) = &report_json {
-                std::fs::write(p, serde_json::to_string_pretty(&report)?).with_context(|| format!("cannot write {}", p.display()))?;
-                eprintln!("report written to {}", p.display());
+            let report = bench::benchmark(&tasks, &session.settings, &opts, None, &on_sample);
+            let comparison = baseline.as_ref().map(|b| bench::compare(b, &report, tolerance));
+            print_bench_summary(&report, comparison.as_ref());
+            for (path, text) in [
+                (&report_json, serde_json::to_string_pretty(&report)?),
+                (&report_csv, bench::csv(&report)),
+                (&report_html, rspostman_core::bench_report::html(&report, comparison.as_ref())),
+            ] {
+                if let Some(p) = path {
+                    std::fs::write(p, text).with_context(|| format!("cannot write {}", p.display()))?;
+                    eprintln!("report written to {}", p.display());
+                }
             }
-            Ok(if report.errors > 0 || report.http_errors > 0 { 1 } else { 0 })
+            let regressed = comparison.as_ref().map(|c| c.regressed).unwrap_or(false);
+            Ok(if report.success() && !regressed { 0 } else { 1 })
         }
         Cmd::Profile { target, req, model, prompt, max_tokens, iterations, delay, env, verbose, insecure, timeout, report_json } => {
             use rspostman_core::profile;

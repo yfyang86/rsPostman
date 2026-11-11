@@ -1,8 +1,8 @@
 // Performance tools: LLM provider profiler and request/collection benchmark.
 import { api } from "./api.js";
 import { state, views, tools, openSingleton, collectionById } from "./state.js";
-import { h, clear, toast, guard, kvEditor, cleanRows, humanSize, humanTime, statusClass } from "./util.js";
-import { normalizeRequest, newRequest, folders, countRequests } from "./model.js";
+import { h, clear, guard, kvEditor, cleanRows, humanSize, humanTime, statusClass, secretInput, isReference } from "./util.js";
+import { normalizeRequest, newRequest, folders, countRequests, makeAuth } from "./model.js";
 
 const fmtMs = (x) => (x === null || x === undefined ? "–" : x < 10 ? x.toFixed(1) : String(Math.round(x)));
 
@@ -10,13 +10,13 @@ function statsTable(title, rows) {
   return h("div", h("div.section-title", title),
     h("table.data", { testid: "stats-table" },
       h("thead", h("tr", ["", "MIN", "P10", "P50", "P90", "P95", "P99", "MAX", "MEAN"].map((x) => h("th", x)))),
-      h("tbody", rows.filter((r) => r[1]).map((r) => h("tr", h("td", r[0]), r.slice(1).map((v) => h("td", fmtMs(v))))))));
+      h("tbody", rows.filter((r) => r.length > 1).map((r) => h("tr", h("td", r[0]), r.slice(1).map((v) => h("td", fmtMs(v))))))));
 }
 
 // ---------------------------------------------------------------- LLM provider profile
 
 views.profile = (tab) => {
-  const cfg = { url: "", headers: [], model: "gpt-4o-mini", prompt: "Say hello in a few words.", maxTokens: "", iterations: "3", delay: "0" };
+  const cfg = { url: "", apiKey: "", headers: [], model: "gpt-4o-mini", prompt: "Say hello in a few words.", maxTokens: "", iterations: "3", delay: "0" };
   let job = null; // { id, done, report, error }
   let timer = null;
   const form = h("div.card");
@@ -31,6 +31,12 @@ views.profile = (tab) => {
       h("div.form-grid",
         h("label", { for: "prof-url" }, "Endpoint URL"),
         h("input", { id: "prof-url", type: "text", placeholder: "https://api.example.com/v1/chat/completions — {{variables}} are supported", value: cfg.url, testid: "profile-url", spellcheck: "false", disabled: running, onInput: (e) => { cfg.url = e.target.value; startBtn.disabled = !cfg.url.trim(); } }),
+        h("label", { for: "prof-key" }, "API key (Bearer)"),
+        (() => {
+          const s = secretInput({ id: "prof-key", testid: "profile-key", placeholder: "sk-… or {{variable}} — sent as Authorization: Bearer, never saved", value: cfg.apiKey, disabled: running,
+            onInput: (e) => { cfg.apiKey = e.target.value; s.refresh(); } }, () => !isReference(cfg.apiKey));
+          return s.el;
+        })(),
         h("label", { for: "prof-model" }, "Model"),
         h("input", { id: "prof-model", type: "text", value: cfg.model, testid: "profile-model", disabled: running, onInput: (e) => { cfg.model = e.target.value; } }),
         h("label", { for: "prof-prompt" }, "Prompt"),
@@ -41,7 +47,7 @@ views.profile = (tab) => {
         h("input", { id: "prof-iterations", type: "number", min: "1", value: cfg.iterations, testid: "profile-iterations", disabled: running, onInput: (e) => { cfg.iterations = e.target.value; } }),
         h("label", { for: "prof-delay" }, "Delay between runs (ms)"),
         h("input", { id: "prof-delay", type: "number", min: "0", value: cfg.delay, testid: "profile-delay", disabled: running, onInput: (e) => { cfg.delay = e.target.value; } })),
-      h("details", { style: "margin:0 0 10px" }, h("summary.muted", { style: "cursor:pointer" }, "Headers"), kvEditor(cfg.headers, { testid: "profile-headers" })),
+      h("details", { style: "margin:0 0 10px" }, h("summary.muted", { style: "cursor:pointer" }, "Extra headers"), kvEditor(cfg.headers, { testid: "profile-headers", maskSensitive: true })),
       h("div.page-actions",
         startBtn,
         h("span.muted", "Sends a streaming chat request and measures health, time to first token, output rate and token usage. Uses the active environment.")));
@@ -107,6 +113,7 @@ views.profile = (tab) => {
   async function start() {
     const request = normalizeRequest(newRequest("POST", cfg.url.trim()));
     request.header = cleanRows(cfg.headers);
+    if (cfg.apiKey.trim()) request.auth = makeAuth("bearer", { token: cfg.apiKey.trim() });
     const r = await guard(() => api.post("/profile", {
       request,
       model: cfg.model.trim(),
@@ -183,26 +190,27 @@ views.benchmark = (tab) => {
         h("input", { id: "bench-delay", type: "number", min: "0", value: cfg.delay, testid: "bench-delay", disabled: running, onInput: (e) => { cfg.delay = e.target.value; } })),
       h("div.page-actions",
         startBtn,
-        h("span.muted", "Runs every request the given number of times and reports latency percentiles, throughput and errors. Uses the active environment.")));
+        h("span.muted", "Runs every request the given number of times (up to 256 workers) and reports latency percentiles, throughput and errors. Uses the active environment.")));
   };
 
   const drawResults = () => {
-    if (!job) return clear(results, h("div.placeholder", "Choose a target and press Run benchmark.", h("br"), "Percentiles P10/P50/P90/P95/P99 are computed over all successful requests."));
+    if (!job) return clear(results, h("div.placeholder", "Choose a target and press Run benchmark.", h("br"), "Percentiles P10/P50/P90/P95/P99 are computed over all answered requests. Scripts are not run; connections are reused."));
     const parts = [];
     if (job.error) parts.push(h("div.error-box", { role: "alert" }, h("b", "Benchmark failed"), job.error));
-    const done = job.report ? job.report.total_requests : 0;
+    const done = job.report ? job.report.total_requests : job.doneCount || 0;
     parts.push(h("div.progress", { role: "progressbar", "aria-valuenow": done, "aria-valuemax": job.total || done }, h("i", { style: `width:${job.done ? 100 : job.total ? Math.min(100, (done / job.total) * 100) : 5}%` })));
     const r = job.report;
     if (r) {
       const o = r.overall;
       parts.push(h("div.stat-row", { testid: "benchmark-stats" },
         h("div.stat", h("b", { testid: "benchmark-requests" }, r.total_requests), h("span", "Requests")),
-        h("div.stat." + (r.errors ? "bad" : "good"), h("b", { testid: "benchmark-errors" }, r.errors), h("span", "Errors")),
+        h("div.stat." + (r.errors ? "bad" : "good"), h("b", { testid: "benchmark-errors" }, r.errors), h("span", "No response")),
+        h("div.stat." + (r.http_errors ? "bad" : "good"), h("b", { testid: "benchmark-http-errors" }, r.http_errors || 0), h("span", "HTTP 4xx / 5xx")),
         h("div.stat", h("b", o ? humanTime(Math.round(o.p50)) : "–"), h("span", "Latency p50")),
         h("div.stat", h("b", o ? humanTime(Math.round(o.p99)) : "–"), h("span", "Latency p99")),
         h("div.stat", h("b", r.duration_ms ? ((r.total_requests - r.errors) / (r.duration_ms / 1000)).toFixed(2) : "0.00"), h("span", "Requests/s")),
         h("div.stat", h("b", humanSize(r.bytes)), h("span", "Received"))));
-      parts.push(statsTable("Latency (successful requests, ms)", [
+      parts.push(statsTable("Latency (answered requests, ms)", [
         ["all requests", ...(o ? [o.min, o.p10, o.p50, o.p90, o.p95, o.p99, o.max, o.mean] : [])],
         ...r.by_name.map((n) => [n.name, ...(n.stats ? [n.stats.min, n.stats.p10, n.stats.p50, n.stats.p90, n.stats.p95, n.stats.p99, n.stats.max, n.stats.mean] : [])]),
       ]));
@@ -224,6 +232,7 @@ views.benchmark = (tab) => {
       const r = await api.get(`/benchmark/${job.id}`);
       job.done = r.done;
       job.total = r.total;
+      job.doneCount = r.done_count;
       job.report = r.report;
       job.error = r.error;
       if (r.done) {

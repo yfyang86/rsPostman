@@ -283,6 +283,7 @@ async function openHistory(id) {
   await guard(async () => {
     const e = await api.get("/history/" + id);
     const source = e.source || (e.exchange.request ? { ...newRequest(e.exchange.request.method, e.exchange.request.url), header: e.exchange.request.headers.map(([key, value]) => ({ key, value })) } : newRequest());
+    if (JSON.stringify(source).includes("<redacted>")) toast("Credentials are not stored in the history – re-enter the fields marked <redacted> before sending.");
     const tab = requestTab({ name: e.name || `${source.method} ${(source.url.raw || source.url || "").toString().replace(/^https?:\/\//, "").slice(0, 40)}`, request: normalizeRequest(clone(source)), exchange: e.exchange, dirty: true });
     openTab(tab);
   });

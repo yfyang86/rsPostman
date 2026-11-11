@@ -14,3 +14,4 @@ Each sprint lives in `Sprints/sprint-N/` and follows the same loop:
 | 2 | Scripting (`pm.*`), collection runner, reporters, mock server, monitors, importers, WebSocket |
 | 3 | GUI: local API server + web UI, Playwright end-to-end tests |
 | 4 | GUI feature completion, Tauri desktop shell, polish, docs |
+| 5 | Review of the profiler / benchmark contribution; credential handling (masking, redaction, prompts, file permissions) |

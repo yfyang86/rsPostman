@@ -1,7 +1,7 @@
 // Request tab: editor (params, auth, headers, body, scripts) and response viewer.
 import { api } from "./api.js";
 import { state, views, requestActions, emit, collectionById, saveCollection, markDirty, refreshData, loadHistory } from "./state.js";
-import { h, clear, toast, guard, modal, kvEditor, cleanRows, tabStrip, highlightJson, prettyJson, prettyXml, humanSize, humanTime, statusClass, download, b64ToBytes, copyText, promptDialog, confirmDialog, uuid, clone, esc } from "./util.js";
+import { h, clear, toast, guard, modal, kvEditor, cleanRows, tabStrip, highlightJson, prettyJson, prettyXml, humanSize, humanTime, statusClass, download, b64ToBytes, copyText, promptDialog, confirmDialog, uuid, clone, esc, isSensitiveName } from "./util.js";
 import { METHODS, syncFromRaw, syncFromQuery, findItem, folders, setScript } from "./model.js";
 import { authEditor } from "./authui.js";
 
@@ -186,8 +186,8 @@ views.request = (tab) => {
     const content = h("div");
     const drawBody = () => {
       if (b.mode === "none") return clear(content, h("p.hint", "This request does not have a body."));
-      if (b.mode === "urlencoded") { b.urlencoded = b.urlencoded || []; return clear(content, kvEditor(b.urlencoded, { onChange: dirty, description: true, testid: "body-urlencoded" })); }
-      if (b.mode === "formdata") { b.formdata = b.formdata || []; return clear(content, kvEditor(b.formdata, { onChange: dirty, fileType: true, onUpload: upload, testid: "body-formdata" })); }
+      if (b.mode === "urlencoded") { b.urlencoded = b.urlencoded || []; return clear(content, kvEditor(b.urlencoded, { onChange: dirty, description: true, testid: "body-urlencoded", maskSensitive: true })); }
+      if (b.mode === "formdata") { b.formdata = b.formdata || []; return clear(content, kvEditor(b.formdata, { onChange: dirty, fileType: true, onUpload: upload, testid: "body-formdata", maskSensitive: true })); }
       if (b.mode === "file") {
         b.file = b.file || { src: "" };
         const path = h("input", { type: "text", value: b.file.src || "", placeholder: "/path/to/file", style: "flex:1", "aria-label": "File path", testid: "body-file", onInput: (e) => { b.file.src = e.target.value; dirty(); } });
@@ -242,7 +242,7 @@ views.request = (tab) => {
     } else if (t === "auth") {
       clear(editor, authEditor(req, { allowInherit: true, collectionId: tab.collectionId, onChange: () => { dirty(); drawSubtabs(); } }));
     } else if (t === "headers") {
-      clear(editor, kvEditor(req.header, { description: true, testid: "headers-table", onChange: () => { dirty(); drawSubtabs(); } }),
+      clear(editor, kvEditor(req.header, { description: true, testid: "headers-table", maskSensitive: true, onChange: () => { dirty(); drawSubtabs(); } }),
         h("p.hint", "User-Agent, Accept, Host, Content-Length and a matching Content-Type are added automatically."));
     } else if (t === "body") {
       clear(editor, bodyEditor());
@@ -401,8 +401,14 @@ views.request = (tab) => {
       body = logs.length ? h("div", { testid: "console" }, logs.map((l) => h("div.log-row." + l.level, h("span.lvl", l.level), h("span", l.message)))) : h("div.placeholder", "Nothing was logged. Use console.log() in scripts.");
     } else if (t === "request") {
       const p = ex.request;
+      // credentials are hidden until asked for (screen sharing, screenshots)
+      const hides = p && p.headers.some(([k, v]) => isSensitiveName(k) && v);
+      const shown = (k, v) => (tab.showSecrets || !isSensitiveName(k) ? v : /^(basic|bearer|digest|oauth|aws4-hmac-sha256)\s/i.test(v) ? v.split(/\s/)[0] + " ••••••••" : "••••••••");
       body = p
-        ? h("div", { testid: "sent-request" }, h("pre.code", { style: "padding-top:12px" }, `${p.method} ${p.url}\n` + p.headers.map(([k, v]) => `${k}: ${v}`).join("\n") + (p.body_preview ? `\n\n${p.body_preview}` : "")))
+        ? h("div", { testid: "sent-request" },
+            hides ? h("div.res-tools", h("span.muted", tab.showSecrets ? "Credentials are visible." : "Credentials are hidden."), h("span.spacer"),
+              h("button.btn.small", { testid: "sent-request-reveal", "aria-pressed": String(!!tab.showSecrets), onClick: () => { tab.showSecrets = !tab.showSecrets; drawResponse(); } }, tab.showSecrets ? "Hide credentials" : "Show credentials")) : null,
+            h("pre.code", { style: "padding-top:12px" }, `${p.method} ${p.url}\n` + p.headers.map(([k, v]) => `${k}: ${shown(k, v)}`).join("\n") + (p.body_preview ? `\n\n${p.body_preview}` : "")))
         : h("div.placeholder", "The request was not sent.");
     } else {
       body = examplesView();

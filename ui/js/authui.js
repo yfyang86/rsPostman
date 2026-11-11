@@ -57,9 +57,9 @@ const OAUTH2_GRANT = [
 const HINTS = {
   inherit: "This item uses the authorization of its parent folder or collection.",
   noauth: "No authorization is sent with the request.",
-  basic: "Tip: put credentials in an environment variable and reference it as {{name}} – the collection file then contains no secret.",
-  bearer: "Tip: store the token in an environment variable and reference it as {{name}} – the collection file then contains no secret.",
-  apikey: "Tip: store the key in an environment variable and reference it as {{name}} – the collection file then contains no secret.",
+  basic: "Tip: keep the password in the vault and reference it as {{vault:name}} – it is then encrypted on disk and the collection file contains no secret.",
+  bearer: "Tip: keep the token in the vault and reference it as {{vault:name}} – it is then encrypted on disk and the collection file contains no secret.",
+  apikey: "Tip: keep the key in the vault and reference it as {{vault:name}} – it is then encrypted on disk and the collection file contains no secret.",
   digest: "The request is retried automatically after the server's 401 challenge.",
   awsv4: "The request is signed with AWS Signature Version 4 when it is sent.",
   oauth1: "The OAuth 1.0a signature is generated when the request is sent.",

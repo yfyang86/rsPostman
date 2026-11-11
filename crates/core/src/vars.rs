@@ -8,6 +8,25 @@ use rand::seq::SliceRandom;
 use rand::Rng;
 use serde::{Deserialize, Serialize};
 
+/// Shared "was a vault secret asked for?" marker. Not part of a scope's identity.
+#[derive(Debug, Clone, Default)]
+pub struct Flag(std::sync::Arc<std::sync::atomic::AtomicBool>);
+
+impl Flag {
+    pub fn set(&self) {
+        self.0.store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+    /// Read and reset.
+    pub fn take(&self) -> bool {
+        self.0.swap(false, std::sync::atomic::Ordering::SeqCst)
+    }
+}
+impl PartialEq for Flag {
+    fn eq(&self, _: &Flag) -> bool {
+        true
+    }
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
 pub struct Scopes {
     #[serde(default)]
@@ -20,6 +39,13 @@ pub struct Scopes {
     pub data: VarMap,
     #[serde(default)]
     pub local: VarMap,
+    /// Decrypted vault secrets, referenced as `{{vault:name}}`. Never serialized, so they are
+    /// not handed to scripts or written anywhere with the other scopes.
+    #[serde(skip)]
+    pub vault: VarMap,
+    /// Set whenever a `{{vault:…}}` reference is resolved (or attempted).
+    #[serde(skip)]
+    pub vault_used: Flag,
 }
 
 impl Scopes {
@@ -51,6 +77,9 @@ impl Scopes {
                     let name = after[..end].trim();
                     let value = if let Some(d) = name.strip_prefix('$') {
                         dynamic(d)
+                    } else if let Some(secret) = name.strip_prefix(crate::vault::REFERENCE_PREFIX) {
+                        self.vault_used.set();
+                        self.vault.get(secret.trim()).cloned()
                     } else {
                         self.get(name).map(|v| if depth < 10 { self.resolve_depth(v, depth + 1) } else { v.clone() })
                     };
@@ -201,11 +230,28 @@ mod tests {
             environment: map(&[("a", "e"), ("url", "http://{{host}}/{{c}}"), ("host", "h")]),
             data: map(&[("a", "d")]),
             local: map(&[]),
+            ..Default::default()
         };
         assert_eq!(s.resolve("{{a}}-{{g}}-{{ c }}"), "d-G-C");
         assert_eq!(s.resolve("{{url}}/x"), "http://h/C/x");
         assert_eq!(s.resolve("{{missing}} {{a"), "{{missing}} {{a");
         assert_eq!(s.unresolved("{{missing}}{{a}}"), ["missing"]);
+    }
+
+    #[test]
+    fn vault_references() {
+        let mut s = Scopes { environment: map(&[("token", "{{vault:api}}"), ("vault:api", "not-this")]), ..Default::default() };
+        s.vault.insert("api".into(), "S3CRET".into());
+        assert!(!s.vault_used.take());
+        // direct, with spaces, and through an environment variable
+        assert_eq!(s.resolve("{{vault:api}} {{ vault: api }} {{token}}"), "S3CRET S3CRET S3CRET");
+        assert!(s.vault_used.take() && !s.vault_used.take());
+        // a missing secret (or a locked vault) leaves the placeholder in place
+        assert_eq!(s.resolve("{{vault:nope}}"), "{{vault:nope}}");
+        assert!(s.vault_used.take());
+        // the vault never travels with the serialized scopes (that is what scripts receive)
+        let json = serde_json::to_string(&s).unwrap();
+        assert!(!json.contains("S3CRET") && !json.contains("\"vault\""), "{json}");
     }
 
     #[test]

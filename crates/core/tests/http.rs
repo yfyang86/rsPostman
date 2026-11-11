@@ -177,11 +177,52 @@ fn session_inherits_auth_and_records_history() {
     let mut s = Session::load(&ws, Some(&c), Some("dev")).unwrap();
     let ex = s.send_item(&c, &id);
     assert_eq!(ex.response.as_ref().unwrap().json().unwrap()["token"], "from-env");
-    rspostman_core::engine::record(&ws, &s.settings, &ex, c.find(&id).unwrap().request.as_ref(), Some(c.id())).unwrap();
+    rspostman_core::engine::record(&ws, &s, &ex, c.find(&id).unwrap().request.as_ref(), Some(c.id())).unwrap();
     s.persist(&ws, None).unwrap();
     let h = ws.history().unwrap();
     assert_eq!(h.len(), 1);
     assert_eq!(h[0].response.as_ref().unwrap().status, 200);
     assert_eq!(h[0].source.as_ref().unwrap().url.raw, "{{base}}/bearer");
+    std::fs::remove_dir_all(&ws.root).ok();
+}
+
+#[test]
+fn vault_values_never_appear_in_the_request_snapshot_or_scripts() {
+    let srv = echo::start("127.0.0.1", 0).unwrap();
+    let ws = Workspace::open(Some(std::env::temp_dir().join(format!("rsp-ws-{}", rspostman_core::model::new_id())))).unwrap();
+    ws.save_settings(&settings()).unwrap();
+    let mut vault = rspostman_core::vault::Vault::create(&ws, "correct horse battery").unwrap();
+    vault.set("tok", "VAULT-SECRET-42").unwrap();
+
+    let mut req = Request::new("GET", &format!("{}/bearer?note={{{{vault:tok}}}}", srv.url()));
+    req.auth = Some(Auth::new("bearer", &[("token", "{{vault:tok}}")]));
+    let scripts = rspostman_core::engine::Scripts {
+        prerequest: vec![r#"console.log("pre", pm.variables.get("vault:tok"), pm.variables.replaceIn("{{vault:tok}}"), JSON.stringify(pm.variables.toObject()));"#.into()],
+        test: vec![r#"pm.test("server got the secret", () => pm.expect(pm.response.json().token).to.equal("VAULT-SECRET-42"));"#.into()],
+    };
+
+    // locked: nothing is sent
+    let mut s = Session::load(&ws, None, None).unwrap();
+    let ex = s.run("r", None, "", &req, req.auth.as_ref(), &scripts);
+    assert!(ex.response.is_none());
+    assert!(ex.error.as_ref().unwrap().contains("vault secret `tok` is not available"), "{:?}", ex.error);
+
+    // unlocked: sent with the secret, but the snapshot and the script console do not have it
+    s.unlock_vault(&vault).unwrap();
+    let ex = s.run("r", None, "", &req, req.auth.as_ref(), &scripts);
+    assert_eq!(ex.response.as_ref().unwrap().status, 200);
+    assert!(ex.tests[0].passed, "{:?}", ex.tests);
+    let snapshot = serde_json::to_string(&ex.request).unwrap();
+    assert!(!snapshot.contains("VAULT-SECRET-42"), "{snapshot}");
+    assert!(snapshot.contains("<redacted>"));
+    let console = serde_json::to_string(&ex.console).unwrap();
+    assert!(!console.contains("VAULT-SECRET-42") && console.contains("{{vault:tok}}"), "{console}");
+    // the vault survived the script round trip
+    assert_eq!(s.scopes.vault.len(), 1);
+
+    rspostman_core::engine::record(&ws, &s, &ex, Some(&req), None).unwrap();
+    let history = std::fs::read_to_string(ws.root.join("history.jsonl")).unwrap();
+    assert!(!history.contains("VAULT-SECRET-42"), "the echoed secret must be scrubbed from the stored response too");
+    assert!(history.contains("{{vault:tok}}"));
     std::fs::remove_dir_all(&ws.root).ok();
 }

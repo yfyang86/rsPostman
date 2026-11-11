@@ -59,6 +59,7 @@ rspostman c set-var Shop base https://api.example.com
 rspostman c add-request Shop "List orders" '{{base}}/orders?state={{state}}'
 rspostman env create dev && rspostman env set dev state open && rspostman env use dev
 rspostman env set dev api_token --secret        # asks for the value, masks it in listings
+rspostman vault set api_token                   # or keep it encrypted: use as {{vault:api_token}}
 rspostman request Shop "List orders"
 
 # import / export (Postman, OpenAPI 3 / Swagger 2, HAR, curl)
@@ -105,6 +106,7 @@ reports two failed assertions and exits with status 1 – add `--folder Auth` fo
 | Collections | Folders, drag-and-drop reordering, duplicate, descriptions, saved examples, collection/folder auth + scripts + variables |
 | Runner | Folder selection, iterations, CSV/JSON data files, delay, bail, flow control, live progress; reports: console, JSON, JUnit XML, HTML |
 | Performance | `benchmark`: latency percentiles P10/P50/P90/P95/P99, req/s, per-request stats for collections, concurrency (connections are reused; scripts are not run; HTTP 4xx/5xx and unreachable hosts are counted separately); `profile`: health of an OpenAI-compatible streaming endpoint (healthy / degraded / unhealthy), time to first token, output rate (tokens/s or events/s), token usage, captured completions |
+| Vault | Secrets encrypted at rest (Argon2id + XChaCha20-Poly1305), unlocked with a passphrase, used as `{{vault:name}}`; never written to history, reports, snapshots or exposed to scripts |
 | Credentials | Masked inputs with a reveal button, secret variables, hidden password prompt and `env:NAME` / `@FILE` sources on the CLI, redaction in history, reports and verbose output, owner-only workspace files – see [Handling credentials](#handling-credentials) |
 | Mock servers | Serve saved examples; path variables, example selection by header, dynamic variables in bodies, CORS, request log |
 | Monitors | `rspostman monitor` runs a collection on an interval and appends results to a JSON-lines log |
@@ -123,7 +125,7 @@ rsPostman covers Postman's local, single-user feature set. These parts are **not
 * In scripts: `require()` of external libraries (only `uuid` and `chai` shims), `pm.cookies.jar()` writes, `setInterval`, the visualizer *renderer* (templates are stored, not rendered).
 * HTTP/3. Mock servers match on method + path (+ query as tie-breaker), not on request bodies.
 * Script editors are plain text areas (no syntax highlighting or autocomplete).
-* Encryption of the workspace at rest / OS keychain integration (see [Handling credentials](#handling-credentials)).
+* OS keychain integration and idle auto-lock for the vault; encryption of files other than the vault (see [Handling credentials](#handling-credentials)).
 
 ## Workspace layout
 
@@ -132,6 +134,7 @@ rsPostman covers Postman's local, single-user feature set. These parts are **not
   collections/<id>.json     Postman Collection v2.1
   environments/<id>.json    Postman environment
   globals.json  cookies.json  settings.json  state.json
+  vault.json                encrypted secrets (see "Handling credentials")
   history.jsonl             one exchange per line (credentials redacted)
   monitors/<collection>.jsonl
   uploads/                  files picked in the browser GUI
@@ -142,8 +145,57 @@ they reference credentials through `{{variables}}` instead of containing them (s
 
 ## Handling credentials
 
-rsPostman does not encrypt the workspace. What it does is keep credentials out of sight and
-out of the places they tend to leak into:
+### The vault – secrets encrypted at rest
+
+Passwords, tokens and keys belong in the **vault**: a file in the workspace (`vault.json`)
+in which every value is encrypted. You unlock it with a passphrase and use a secret anywhere a
+variable works – URL, header, body, auth field, or as the value of an environment variable –
+by writing `{{vault:name}}`.
+
+```bash
+rspostman vault set github_token                 # creates the vault on first use; hidden prompts
+rspostman send https://api.github.com/user --bearer '{{vault:github_token}}'
+rspostman vault list                             # names only, no passphrase needed
+rspostman vault get github_token                 # print one secret
+rspostman vault passwd                           # change the passphrase (re-encrypts everything)
+```
+
+In the GUI, the padlock next to the environment selector opens the vault screen (create,
+unlock, store, delete, lock, change passphrase). The CLI asks for the passphrase when a
+request needs the vault; for scripts and CI set `RSPOSTMAN_VAULT_PASSPHRASE`.
+
+What the vault guarantees:
+
+* **On disk** values are sealed with XChaCha20-Poly1305 under a key derived from the
+  passphrase with Argon2id (19 MiB, 2 passes, random salt). Each value has its own random
+  nonce and is bound to its name, so entries cannot be swapped or altered unnoticed. Secret
+  *names* are stored in clear. The passphrase is stored nowhere.
+* **In use** a vault secret is decrypted only to build the request that is sent. It is removed
+  from the request snapshot (so neither the GUI's "Request" tab nor `-v --show-secrets` shows
+  it), from the history (including a response that echoes it back), from run reports and from
+  error messages. Collections, environments and history entries only ever contain the
+  `{{vault:name}}` reference, so they can be shared and replayed.
+* **Scripts** cannot read the vault: `pm.variables.get` / `replaceIn` do not resolve
+  `{{vault:…}}`. Mock servers and the variable preview do not resolve it either.
+* **Locked means not sent.** If the vault is locked or a secret is missing, the request fails
+  with an explanation instead of sending the placeholder text to a server.
+* The GUI can store and replace secrets but never displays a stored value again.
+
+What it does not do:
+
+* There is **no recovery**: a lost passphrase means the vault's contents are lost.
+* The vault is unlocked per `rspostman` process. The GUI keeps it unlocked (key in the
+  backend's memory) until you press *Lock now* or quit; there is no idle auto-lock yet.
+* Generated code snippets contain the real secret – that is what a snippet is for.
+* Secrets shorter than 4 characters are not scrubbed from responses and error messages.
+* It protects files at rest, not a compromised machine: malware running as your user while
+  the vault is unlocked, or a server that receives the secret, is out of scope.
+* The OS keychain is not used; the passphrase is typed or supplied through the environment.
+
+### Everything else
+
+For credentials that are not in the vault, rsPostman keeps them out of sight and out of the
+places they tend to leak into:
 
 * **Typing them.** In the GUI, passwords, tokens and keys are shown as dots (auth fields,
   secret variables, and header / form values whose name looks like a credential such as
@@ -174,12 +226,11 @@ out of the places they tend to leak into:
 * **Files.** The workspace directory is created with mode `0700` and every file in it is
   written with mode `0600` (Unix), so other accounts on the machine cannot read it.
 
-Still plain text on disk, by design of the file formats: whatever you type into a collection,
-environment or the cookie jar. Recommended practice is to keep secrets in an environment
-(marked secret) and reference them as `{{name}}`; then collection files and exports contain no
-secret. Exported environments do contain their values, and generated code snippets contain
-the resolved credentials – that is their purpose. Redaction is name-based: a credential in an
-unusually named field, in free-text bodies or in a URL path is not recognised.
+Still plain text on disk: whatever you type *literally* into a collection or environment, and
+the cookie jar. Put such values in the vault and reference them instead. Exported environments
+contain their values. For non-vault credentials the redaction is name-based: one in an
+unusually named field, a free-text body or a URL path is not recognised (vault secrets are
+removed by value, wherever they appear).
 
 ## Security notes
 

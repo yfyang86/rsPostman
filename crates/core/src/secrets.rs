@@ -288,6 +288,56 @@ pub fn redact_exchange(ex: &Exchange) -> Exchange {
     out
 }
 
+/// Secrets shorter than this are not scrubbed by value (they would shred unrelated text).
+pub const MIN_SCRUB_LEN: usize = 4;
+
+/// Replace every occurrence of the given secret values in `text`.
+pub fn scrub_text(text: &str, values: &[String]) -> String {
+    let mut out = text.to_string();
+    for v in values.iter().filter(|v| v.chars().count() >= MIN_SCRUB_LEN) {
+        if out.contains(v.as_str()) {
+            out = out.replace(v.as_str(), REDACTED);
+        }
+    }
+    out
+}
+
+fn scrub_json(v: &mut Value, values: &[String]) {
+    match v {
+        Value::String(s) => *s = scrub_text(s, values),
+        Value::Array(a) => a.iter_mut().for_each(|x| scrub_json(x, values)),
+        Value::Object(o) => o.values_mut().for_each(|x| scrub_json(x, values)),
+        _ => {}
+    }
+}
+
+/// Remove secret values (vault contents) from a wire snapshot, wherever they appear.
+pub fn scrub_prepared(p: &Prepared, values: &[String]) -> Prepared {
+    let mut v = serde_json::to_value(p).unwrap_or(Value::Null);
+    scrub_json(&mut v, values);
+    serde_json::from_value(v).unwrap_or_else(|_| redact_prepared(p))
+}
+
+/// Remove secret values from a response (URL, headers and text body).
+pub fn scrub_response(r: &Response, values: &[String]) -> Response {
+    let mut out = r.clone();
+    out.url = scrub_text(&r.url, values);
+    out.redirects = r.redirects.iter().map(|u| scrub_text(u, values)).collect();
+    for (_, v) in out.headers.iter_mut() {
+        *v = scrub_text(v, values);
+    }
+    for c in out.cookies.iter_mut() {
+        c.value = scrub_text(&c.value, values);
+    }
+    if let Ok(text) = std::str::from_utf8(&r.body) {
+        let scrubbed = scrub_text(text, values);
+        if scrubbed != text {
+            out.body = scrubbed.into_bytes();
+        }
+    }
+    out
+}
+
 /// True when a request read back from the history had credentials removed.
 pub fn was_redacted(r: &Request) -> bool {
     serde_json::to_string(r).map(|s| s.contains(REDACTED)).unwrap_or(false)
@@ -376,6 +426,25 @@ mod tests {
         let mut by_ref = Request::new("GET", "{{base}}/x");
         by_ref.auth = Some(Auth::new("bearer", &[("token", "{{token}}")]));
         assert!(!was_redacted(&redact_request(&by_ref)));
+    }
+
+    #[test]
+    fn scrubbing_by_value() {
+        let values = vec!["S3CRET-VALUE".to_string(), "abc".to_string()];
+        assert_eq!(scrub_text("x S3CRET-VALUE y abc", &values), "x <redacted> y abc", "short values are left alone");
+        let p = Prepared {
+            method: "GET".into(),
+            url: "http://h/path/S3CRET-VALUE/x".into(),
+            headers: vec![("X-Odd-Name".into(), "pre-S3CRET-VALUE".into())],
+            body: BodySpec::Raw { text: "free text S3CRET-VALUE".into() },
+            digest: Some(("u".into(), "S3CRET-VALUE".into())),
+        };
+        let out = scrub_prepared(&p, &values);
+        assert!(!serde_json::to_string(&out).unwrap().contains("S3CRET-VALUE"));
+        assert_eq!(out.url, "http://h/path/<redacted>/x");
+        let r = Response { url: "http://h/S3CRET-VALUE".into(), headers: vec![("X-Echo".into(), "S3CRET-VALUE".into())], body: b"{\"echo\": \"S3CRET-VALUE\"}".to_vec(), ..Default::default() };
+        let out = scrub_response(&r, &values);
+        assert!(!serde_json::to_string(&out).unwrap().contains("S3CRET") && !out.text().contains("S3CRET"));
     }
 
     #[test]

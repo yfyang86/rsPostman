@@ -24,6 +24,7 @@ pub fn redacted(summary: &RunSummary) -> RunSummary {
     let mut s = summary.clone();
     for x in s.executions.iter_mut() {
         x.exchange = crate::secrets::redact_exchange(&x.exchange);
+        x.exchange.response = x.exchange.response.as_ref().map(|r| crate::secrets::scrub_response(r, &summary.scrub));
     }
     s
 }

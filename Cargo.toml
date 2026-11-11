@@ -16,6 +16,12 @@ anyhow = "1"
 serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["preserve_order"] }
 
+# The vault's key derivation is deliberately expensive; keep it fast in debug builds and tests.
+[profile.dev.package.argon2]
+opt-level = 3
+[profile.dev.package.blake2]
+opt-level = 3
+
 [profile.release]
 opt-level = 2
 strip = true

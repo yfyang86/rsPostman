@@ -15,3 +15,4 @@ Each sprint lives in `Sprints/sprint-N/` and follows the same loop:
 | 3 | GUI: local API server + web UI, Playwright end-to-end tests |
 | 4 | GUI feature completion, Tauri desktop shell, polish, docs |
 | 5 | Review of the profiler / benchmark contribution; credential handling (masking, redaction, prompts, file permissions) |
+| 6 | Local vault: secrets encrypted at rest, `{{vault:name}}` |

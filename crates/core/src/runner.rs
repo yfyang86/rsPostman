@@ -56,6 +56,9 @@ pub struct RunSummary {
     pub stats: RunStats,
     /// Why the run ended early (bail, flow control error), if it did.
     pub aborted: Option<String>,
+    /// Vault secrets that were available to the run; removed from every report. Never serialized.
+    #[serde(skip)]
+    pub scrub: Vec<String>,
 }
 
 impl RunSummary {
@@ -166,6 +169,7 @@ pub fn run(collection: &Collection, session: &mut Session, opts: &RunOptions, on
         executions: vec![],
         stats: RunStats::default(),
         aborted: None,
+        scrub: session.vault_values(),
     };
     session.iteration_count = iterations;
     if !on_event(RunEvent::Start { requests: list.len(), iterations }) {

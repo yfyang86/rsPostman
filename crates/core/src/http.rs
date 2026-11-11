@@ -400,6 +400,14 @@ pub fn prepare(req: &Request, auth: Option<&Auth>, sc: &Scopes) -> Result<Prepar
     if let Some(a) = auth {
         crate::auth::apply(a, &mut p, sc)?;
     }
+    // A vault reference that could not be resolved must not be sent to a server as text.
+    let missing = crate::vault::references(&serde_json::to_string(&p).unwrap_or_default());
+    if !missing.is_empty() {
+        return Err(anyhow!(
+            "vault secret `{}` is not available: the vault is locked or has no secret with that name",
+            missing.join("`, `")
+        ));
+    }
     Ok(p)
 }
 

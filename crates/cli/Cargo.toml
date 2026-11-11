@@ -11,6 +11,7 @@ path = "src/main.rs"
 
 [dependencies]
 rspostman-core = { path = "../core" }
+rspostman-server = { path = "../server" }
 anyhow.workspace = true
 serde.workspace = true
 serde_json.workspace = true

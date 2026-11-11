@@ -23,7 +23,6 @@ url = "2"
 percent-encoding = "2"
 indexmap = { version = "2", features = ["serde"] }
 dirs = "5"
-tiny_http = "0.12"
 boa_engine = "0.20"
 serde_yaml = "0.9"
 tungstenite = { version = "0.24", features = ["rustls-tls-native-roots"] }

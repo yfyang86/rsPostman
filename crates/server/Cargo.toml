@@ -1,0 +1,15 @@
+[package]
+name = "rspostman-server"
+description = "Local API server and embedded web UI of rsPostman"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+rspostman-core = { path = "../core" }
+anyhow.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+include_dir = "0.7"
+chrono = "0.4"
+url = "2"

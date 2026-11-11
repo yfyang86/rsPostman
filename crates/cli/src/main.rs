@@ -287,6 +287,14 @@ enum Cmd {
         #[arg(short, long)]
         output: Option<PathBuf>,
     },
+    /// Start the graphical interface (local web UI) and open it in the browser
+    Gui {
+        #[arg(short, long, default_value_t = 8686)]
+        port: u16,
+        /// Do not open the browser automatically
+        #[arg(long)]
+        no_open: bool,
+    },
     /// Show or change settings
     #[command(subcommand)]
     Settings(SettingsCmd),
@@ -1385,6 +1393,20 @@ fn run(cli: Cli) -> Result<i32> {
                 other => bail!("unknown format `{other}` (use md or html)"),
             };
             write_out(text.trim_end(), &output)?;
+            Ok(0)
+        }
+        Cmd::Gui { port, no_open } => {
+            let srv = rspostman_server::start(ws.clone(), port)?;
+            let url = srv.url();
+            eprintln!("rsPostman is running at {url}  (Ctrl-C to stop)");
+            eprintln!("workspace: {}", ws.root.display());
+            if !no_open {
+                let opener = if cfg!(target_os = "macos") { "open" } else if cfg!(target_os = "windows") { "explorer" } else { "xdg-open" };
+                if std::process::Command::new(opener).arg(&url).stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null()).spawn().is_err() {
+                    eprintln!("could not open a browser automatically; open {url} manually");
+                }
+            }
+            srv.join();
             Ok(0)
         }
         Cmd::Settings(cmd) => settings_cmd(&ws, cmd),

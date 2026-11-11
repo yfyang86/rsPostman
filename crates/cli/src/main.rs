@@ -1,0 +1,994 @@
+//! `rspostman` command line interface.
+
+#![allow(clippy::large_enum_variant)]
+
+mod out;
+
+use anyhow::{anyhow, bail, Context, Result};
+use clap::{Args, Parser, Subcommand};
+use rspostman_core::http::Settings;
+use rspostman_core::import::Imported;
+use rspostman_core::model::{Auth, Body, Collection, Environment, GraphQl, Item, Request, KV};
+use rspostman_core::{codegen, engine, Exchange, Session, Workspace};
+use std::path::PathBuf;
+
+#[derive(Parser)]
+#[command(name = "rspostman", version, about = "rsPostman - a local-first, Postman-compatible API client")]
+struct Cli {
+    /// Workspace directory (default: $RSPOSTMAN_HOME or ~/.rspostman)
+    #[arg(short, long, global = true)]
+    workspace: Option<PathBuf>,
+    /// Disable coloured output
+    #[arg(long, global = true)]
+    no_color: bool,
+    #[command(subcommand)]
+    cmd: Cmd,
+}
+
+#[derive(Args, Clone, Default)]
+struct RequestArgs {
+    /// Header, repeatable
+    #[arg(short = 'H', long = "header", value_name = "NAME:VALUE")]
+    headers: Vec<String>,
+    /// Query parameter, repeatable
+    #[arg(short = 'q', long = "query", value_name = "KEY=VALUE")]
+    query: Vec<String>,
+    /// Raw body (`@file` reads the text from a file)
+    #[arg(short = 'd', long)]
+    data: Option<String>,
+    /// JSON body (sets Content-Type: application/json)
+    #[arg(long)]
+    json: Option<String>,
+    /// x-www-form-urlencoded field, repeatable
+    #[arg(long = "form", value_name = "KEY=VALUE")]
+    form: Vec<String>,
+    /// multipart/form-data field, repeatable (`key=@path` uploads a file)
+    #[arg(short = 'F', long = "multipart", value_name = "KEY=VALUE|KEY=@FILE")]
+    multipart: Vec<String>,
+    /// Send a file as binary body
+    #[arg(long, value_name = "FILE")]
+    body_file: Option<String>,
+    /// GraphQL query
+    #[arg(long)]
+    graphql: Option<String>,
+    /// GraphQL variables (JSON)
+    #[arg(long, value_name = "JSON")]
+    graphql_vars: Option<String>,
+    /// Basic auth
+    #[arg(short = 'u', long = "user", value_name = "USER:PASS")]
+    user: Option<String>,
+    /// Bearer token
+    #[arg(long, value_name = "TOKEN")]
+    bearer: Option<String>,
+    /// API key sent as header
+    #[arg(long, value_name = "NAME=VALUE")]
+    api_key: Option<String>,
+    /// Auth type (noauth, basic, bearer, apikey, digest, oauth1, oauth2, awsv4, jwt) used with --auth-param
+    #[arg(long, value_name = "TYPE")]
+    auth: Option<String>,
+    /// Auth parameter for --auth, repeatable (e.g. username=bob)
+    #[arg(long, value_name = "KEY=VALUE")]
+    auth_param: Vec<String>,
+}
+
+#[derive(Args, Clone, Default)]
+struct ExecArgs {
+    /// Environment (name, id or exported file); default: the active environment
+    #[arg(short, long)]
+    env: Option<String>,
+    /// Override a variable for this invocation, repeatable
+    #[arg(long = "var", value_name = "KEY=VALUE")]
+    vars: Vec<String>,
+    /// Show response headers
+    #[arg(short, long)]
+    include: bool,
+    /// Show the request that was sent and response headers
+    #[arg(short, long)]
+    verbose: bool,
+    /// Write the response body to a file
+    #[arg(short, long, value_name = "FILE")]
+    output: Option<PathBuf>,
+    /// Do not pretty-print the body
+    #[arg(long)]
+    raw: bool,
+    /// Do not record this request in the history
+    #[arg(long)]
+    no_history: bool,
+    /// Exit with status 22 when the HTTP status is >= 400
+    #[arg(long)]
+    fail: bool,
+    /// Skip TLS certificate verification
+    #[arg(short = 'k', long)]
+    insecure: bool,
+    /// Timeout in milliseconds
+    #[arg(long, value_name = "MS")]
+    timeout: Option<u64>,
+    /// Do not follow redirects
+    #[arg(long)]
+    no_redirect: bool,
+}
+
+#[derive(Subcommand)]
+enum Cmd {
+    /// Send an ad-hoc request: `send [METHOD] URL`
+    Send {
+        /// `[METHOD] URL`
+        #[arg(required = true, num_args = 1..=2, value_name = "[METHOD] URL")]
+        target: Vec<String>,
+        #[command(flatten)]
+        req: RequestArgs,
+        #[command(flatten)]
+        exec: ExecArgs,
+    },
+    /// Send a request saved in a collection
+    #[command(alias = "req")]
+    Request {
+        collection: String,
+        /// Request id, name or `Folder/Name` path
+        request: String,
+        #[command(flatten)]
+        exec: ExecArgs,
+    },
+    /// Manage collections
+    #[command(alias = "c", subcommand)]
+    Collection(CollectionCmd),
+    /// Manage environments
+    #[command(subcommand)]
+    Env(EnvCmd),
+    /// Manage global variables
+    #[command(subcommand)]
+    Globals(VarCmd),
+    /// Request history
+    #[command(subcommand)]
+    History(HistoryCmd),
+    /// Cookie jar
+    #[command(subcommand)]
+    Cookies(CookiesCmd),
+    /// Import a Postman collection / environment file or a curl command (`-` reads stdin)
+    Import {
+        /// File path, `-` for stdin, or a literal curl command
+        source: String,
+        /// Target collection for imported curl requests (created when missing)
+        #[arg(short, long)]
+        collection: Option<String>,
+        /// Name for an imported curl request
+        #[arg(short, long)]
+        name: Option<String>,
+    },
+    /// Export a collection, environment or the globals as Postman JSON
+    #[command(subcommand)]
+    Export(ExportCmd),
+    /// Generate a code snippet (`codegen --list` shows the languages)
+    Codegen {
+        /// Target language
+        #[arg(default_value = "curl")]
+        lang: String,
+        /// List supported languages
+        #[arg(long)]
+        list: bool,
+        /// Collection containing the request
+        #[arg(short, long, requires = "request")]
+        collection: Option<String>,
+        /// Request id, name or path in the collection
+        #[arg(short, long, requires = "collection")]
+        request: Option<String>,
+        /// Ad-hoc request: `[METHOD] URL`
+        #[arg(num_args = 0..=2, value_name = "[METHOD] URL")]
+        target: Vec<String>,
+        #[command(flatten)]
+        req: RequestArgs,
+        #[arg(short, long)]
+        env: Option<String>,
+    },
+    /// Show or change settings
+    #[command(subcommand)]
+    Settings(SettingsCmd),
+    /// Run the built-in echo (httpbin-like) test server
+    Echo {
+        #[arg(short, long, default_value_t = 8642)]
+        port: u16,
+        #[arg(long, default_value = "127.0.0.1")]
+        host: String,
+    },
+}
+
+#[derive(Subcommand)]
+enum CollectionCmd {
+    /// List collections
+    #[command(alias = "ls")]
+    List,
+    /// Create an empty collection
+    Create { name: String, #[arg(short, long)] description: Option<String> },
+    /// Show the tree of a collection
+    Show { collection: String },
+    /// Delete a collection
+    #[command(alias = "rm")]
+    Delete { collection: String },
+    /// Rename a collection
+    Rename { collection: String, name: String },
+    /// Duplicate a collection
+    Duplicate { collection: String, #[arg(short, long)] name: Option<String> },
+    /// Add a folder
+    AddFolder {
+        collection: String,
+        name: String,
+        /// Parent folder (id, name or path)
+        #[arg(short, long)]
+        parent: Option<String>,
+    },
+    /// Add a request: `add-request <collection> <name> [METHOD] URL`
+    AddRequest {
+        collection: String,
+        name: String,
+        #[arg(required = true, num_args = 1..=2, value_name = "[METHOD] URL")]
+        target: Vec<String>,
+        #[arg(short, long)]
+        parent: Option<String>,
+        #[command(flatten)]
+        req: RequestArgs,
+    },
+    /// Remove a folder or request
+    Remove { collection: String, item: String },
+    /// Move an item into another folder (omit --to for the collection root)
+    Move { collection: String, item: String, #[arg(long)] to: Option<String>, #[arg(long)] index: Option<usize> },
+    /// Rename a folder or request
+    RenameItem { collection: String, item: String, name: String },
+    /// Set a collection variable
+    SetVar { collection: String, key: String, value: String },
+    /// Remove a collection variable
+    UnsetVar { collection: String, key: String },
+    /// Set the auth of the collection or of one item (`--auth noauth`, `--auth inherit` ...)
+    SetAuth {
+        collection: String,
+        /// Folder or request; omit for the collection itself
+        #[arg(long)]
+        item: Option<String>,
+        #[arg(long = "type", value_name = "TYPE")]
+        kind: String,
+        #[arg(long = "param", value_name = "KEY=VALUE")]
+        params: Vec<String>,
+    },
+}
+
+#[derive(Subcommand)]
+enum EnvCmd {
+    /// List environments (the active one is marked with *)
+    #[command(alias = "ls")]
+    List,
+    Create { name: String },
+    Show { env: String },
+    #[command(alias = "rm")]
+    Delete { env: String },
+    Rename { env: String, name: String },
+    /// Set a variable
+    Set { env: String, key: String, value: String },
+    /// Remove a variable
+    Unset { env: String, key: String },
+    /// Select the active environment (`none` clears it)
+    Use { env: String },
+}
+
+#[derive(Subcommand)]
+enum VarCmd {
+    #[command(alias = "ls")]
+    List,
+    Set { key: String, value: String },
+    Unset { key: String },
+}
+
+#[derive(Subcommand)]
+enum HistoryCmd {
+    /// List recent requests (most recent first)
+    #[command(alias = "ls")]
+    List { #[arg(short = 'n', long, default_value_t = 20)] limit: usize },
+    /// Show one entry (number from `history list`, or id prefix)
+    Show { entry: String },
+    /// Send an entry again
+    Replay {
+        entry: String,
+        #[command(flatten)]
+        exec: ExecArgs,
+    },
+    /// Delete the whole history
+    Clear,
+}
+
+#[derive(Subcommand)]
+enum CookiesCmd {
+    #[command(alias = "ls")]
+    List,
+    /// Set a cookie for a URL, e.g. `cookies set http://localhost:3000 "sid=1; Path=/"`
+    Set { url: String, cookie: String },
+    /// Remove all cookies, the cookies of one domain, or one cookie
+    Clear { domain: Option<String>, name: Option<String> },
+}
+
+#[derive(Subcommand)]
+enum ExportCmd {
+    Collection { collection: String, #[arg(short, long)] output: Option<PathBuf> },
+    Env { env: String, #[arg(short, long)] output: Option<PathBuf> },
+    Globals { #[arg(short, long)] output: Option<PathBuf> },
+}
+
+#[derive(Subcommand)]
+enum SettingsCmd {
+    Show,
+    /// Set a value, e.g. `settings set timeout_ms 5000`
+    Set { key: String, value: String },
+    Reset,
+}
+
+fn kv(s: &str, sep: char, what: &str) -> Result<(String, String)> {
+    s.split_once(sep).map(|(k, v)| (k.trim().to_string(), v.trim_start().to_string())).ok_or_else(|| anyhow!("{what} must look like KEY{sep}VALUE, got `{s}`"))
+}
+
+fn target(parts: &[String], has_body: bool) -> Result<(String, String)> {
+    match parts {
+        [url] => Ok((if has_body { "POST" } else { "GET" }.to_string(), url.clone())),
+        [m, url] => Ok((m.to_uppercase(), url.clone())),
+        _ => bail!("expected `[METHOD] URL`"),
+    }
+}
+
+fn build_auth(kind: &str, params: &[String]) -> Result<Option<Auth>> {
+    if kind == "inherit" {
+        return Ok(None);
+    }
+    if !rspostman_core::auth::AUTH_TYPES.contains(&kind) {
+        bail!("unknown auth type `{kind}` (supported: {})", rspostman_core::auth::AUTH_TYPES.join(", "));
+    }
+    let mut a = Auth { kind: kind.to_string(), ..Default::default() };
+    for p in params {
+        let (k, v) = kv(p, '=', "auth parameter")?;
+        a.params.insert(k, v);
+    }
+    Ok(Some(a))
+}
+
+fn build_request(parts: &[String], a: &RequestArgs) -> Result<Request> {
+    let has_body = a.data.is_some() || a.json.is_some() || !a.form.is_empty() || !a.multipart.is_empty() || a.body_file.is_some() || a.graphql.is_some();
+    let (method, url) = target(parts, has_body)?;
+    let mut req = Request::new(&method, &url);
+    for q in &a.query {
+        let (k, v) = kv(q, '=', "query parameter")?;
+        req.url.query.push(KV::new(k, v));
+    }
+    if !a.query.is_empty() {
+        req.url.sync_raw_from_query();
+    }
+    for h in &a.headers {
+        let (k, v) = kv(h, ':', "header")?;
+        req.header.push(KV::new(k, v));
+    }
+    let read = |s: &str| -> Result<String> {
+        match s.strip_prefix('@') {
+            Some(p) => std::fs::read_to_string(p).with_context(|| format!("cannot read {p}")),
+            None => Ok(s.to_string()),
+        }
+    };
+    if let Some(j) = &a.json {
+        req.body = Some(Body::raw(&read(j)?, "json"));
+    } else if let Some(d) = &a.data {
+        let text = read(d)?;
+        let lang = if serde_json::from_str::<serde_json::Value>(&text).map(|v| v.is_object() || v.is_array()).unwrap_or(false) { "json" } else { "text" };
+        req.body = Some(Body::raw(&text, lang));
+    } else if !a.form.is_empty() {
+        let mut fields = vec![];
+        for f in &a.form {
+            let (k, v) = kv(f, '=', "form field")?;
+            fields.push(KV::new(k, v));
+        }
+        req.body = Some(Body { mode: "urlencoded".into(), urlencoded: fields, ..Default::default() });
+    } else if !a.multipart.is_empty() {
+        let mut fields = vec![];
+        for f in &a.multipart {
+            let (k, v) = kv(f, '=', "multipart field")?;
+            let mut row = KV::new(k, "");
+            match v.strip_prefix('@') {
+                Some(path) => {
+                    row.kind = Some("file".into());
+                    row.src = Some(serde_json::json!(path));
+                }
+                None => {
+                    row.kind = Some("text".into());
+                    row.value = v;
+                }
+            }
+            fields.push(row);
+        }
+        req.body = Some(Body { mode: "formdata".into(), formdata: fields, ..Default::default() });
+    } else if let Some(f) = &a.body_file {
+        req.body = Some(Body { mode: "file".into(), file: Some(serde_json::json!({ "src": f })), ..Default::default() });
+    } else if let Some(g) = &a.graphql {
+        req.body = Some(Body {
+            mode: "graphql".into(),
+            graphql: Some(GraphQl { query: read(g)?, variables: a.graphql_vars.clone().unwrap_or_default() }),
+            ..Default::default()
+        });
+    }
+    if let Some(u) = &a.user {
+        let (name, pass) = u.split_once(':').unwrap_or((u, ""));
+        req.auth = Some(Auth::new("basic", &[("username", name), ("password", pass)]));
+    } else if let Some(t) = &a.bearer {
+        req.auth = Some(Auth::new("bearer", &[("token", t)]));
+    } else if let Some(k) = &a.api_key {
+        let (name, value) = kv(k, '=', "--api-key")?;
+        req.auth = Some(Auth::new("apikey", &[("key", &name), ("value", &value), ("in", "header")]));
+    } else if let Some(t) = &a.auth {
+        req.auth = build_auth(t, &a.auth_param)?;
+    }
+    Ok(req)
+}
+
+fn apply_exec(session: &mut Session, exec: &ExecArgs) -> Result<()> {
+    for v in &exec.vars {
+        let (k, val) = kv(v, '=', "--var")?;
+        session.scopes.local.insert(k, val);
+    }
+    if exec.insecure {
+        session.settings.verify_ssl = false;
+    }
+    if let Some(t) = exec.timeout {
+        session.settings.timeout_ms = t;
+    }
+    if exec.no_redirect {
+        session.settings.follow_redirects = false;
+    }
+    Ok(())
+}
+
+/// Print an exchange; returns the process exit code.
+fn report(ex: &Exchange, exec: &ExecArgs) -> Result<i32> {
+    if exec.verbose {
+        if let Some(p) = &ex.request {
+            out::request(p);
+        }
+    }
+    if let Some(e) = &ex.error {
+        eprintln!("{} {e}", out::red("error:"));
+        return Ok(1);
+    }
+    let Some(r) = &ex.response else { return Ok(1) };
+    out::response_meta(r, exec.include || exec.verbose);
+    match &exec.output {
+        Some(path) => {
+            std::fs::write(path, &r.body).with_context(|| format!("cannot write {}", path.display()))?;
+            eprintln!("{}", out::dim(&format!("body saved to {}", path.display())));
+        }
+        None => {
+            let text = out::body_text(r, exec.raw);
+            if !text.is_empty() {
+                println!("{text}");
+            }
+        }
+    }
+    Ok(if exec.fail && r.status >= 400 { 22 } else { 0 })
+}
+
+fn resolve_item<'a>(c: &'a Collection, reference: &str) -> Result<&'a Item> {
+    c.resolve(reference).ok_or_else(|| anyhow!("`{reference}` not found in collection `{}`", c.info.name))
+}
+
+fn stored(ws: &Workspace, reference: &str) -> Result<Collection> {
+    let c = ws.find_collection(reference)?;
+    if ws.collection(c.id())?.is_none() {
+        bail!("`{reference}` is a file, not a workspace collection; run `rspostman import {reference}` first");
+    }
+    Ok(c)
+}
+
+fn write_out(text: &str, output: &Option<PathBuf>) -> Result<()> {
+    match output {
+        Some(p) => {
+            std::fs::write(p, text).with_context(|| format!("cannot write {}", p.display()))?;
+            eprintln!("written to {}", p.display());
+        }
+        None => println!("{text}"),
+    }
+    Ok(())
+}
+
+fn print_tree(items: &[Item], depth: usize) {
+    for it in items {
+        let pad = "  ".repeat(depth);
+        match (&it.item, &it.request) {
+            (Some(children), _) => {
+                println!("{pad}{} {}", out::bold("▸"), out::bold(&it.name));
+                print_tree(children, depth + 1);
+            }
+            (None, Some(r)) => println!("{pad}{} {}  {}", out::method(&r.method), it.name, out::dim(&r.url.raw)),
+            _ => println!("{pad}{}", it.name),
+        }
+    }
+}
+
+fn print_vars(rows: Vec<(String, String, bool)>) {
+    if rows.is_empty() {
+        println!("(no variables)");
+        return;
+    }
+    out::table(
+        &["KEY", "VALUE", ""],
+        &rows.into_iter().map(|(k, v, on)| vec![k, v, if on { String::new() } else { "(disabled)".into() }]).collect::<Vec<_>>(),
+    );
+}
+
+fn collection_cmd(ws: &Workspace, cmd: CollectionCmd) -> Result<i32> {
+    match cmd {
+        CollectionCmd::List => {
+            let rows: Vec<Vec<String>> =
+                ws.collections()?.iter().map(|c| vec![c.info.name.clone(), c.requests().len().to_string(), c.id().to_string()]).collect();
+            if rows.is_empty() {
+                println!("No collections yet. Create one with `rspostman collection create <name>` or `rspostman import <file>`.");
+            } else {
+                out::table(&["NAME", "REQUESTS", "ID"], &rows);
+            }
+        }
+        CollectionCmd::Create { name, description } => {
+            let mut c = Collection::new(&name);
+            c.info.description = description;
+            ws.save_collection(&c)?;
+            println!("created collection `{name}` ({})", c.id());
+        }
+        CollectionCmd::Show { collection } => {
+            let c = ws.find_collection(&collection)?;
+            println!("{}  {}", out::bold(&c.info.name), out::dim(c.id()));
+            if let Some(d) = &c.info.description {
+                println!("{d}");
+            }
+            if let Some(a) = &c.auth {
+                println!("auth: {}", a.kind);
+            }
+            if !c.variable.is_empty() {
+                println!("variables: {}", c.variable.iter().map(|v| format!("{}={}", v.key, v.value)).collect::<Vec<_>>().join(", "));
+            }
+            println!();
+            print_tree(&c.item, 0);
+        }
+        CollectionCmd::Delete { collection } => {
+            let c = stored(ws, &collection)?;
+            ws.delete_collection(c.id())?;
+            println!("deleted collection `{}`", c.info.name);
+        }
+        CollectionCmd::Rename { collection, name } => {
+            let mut c = stored(ws, &collection)?;
+            c.info.name = name.clone();
+            ws.save_collection(&c)?;
+            println!("renamed to `{name}`");
+        }
+        CollectionCmd::Duplicate { collection, name } => {
+            let mut c = ws.find_collection(&collection)?;
+            c.info.name = name.unwrap_or_else(|| format!("{} Copy", c.info.name));
+            c.info.id = rspostman_core::model::new_id();
+            ws.save_collection(&c)?;
+            println!("created `{}` ({})", c.info.name, c.id());
+        }
+        CollectionCmd::AddFolder { collection, name, parent } => {
+            let mut c = stored(ws, &collection)?;
+            let pid = match &parent {
+                Some(p) => Some(resolve_item(&c, p)?.id.clone()),
+                None => None,
+            };
+            c.add_item(pid.as_deref(), Item::folder(&name))?;
+            ws.save_collection(&c)?;
+            println!("added folder `{name}`");
+        }
+        CollectionCmd::AddRequest { collection, name, target, parent, req } => {
+            let mut c = stored(ws, &collection)?;
+            let pid = match &parent {
+                Some(p) => Some(resolve_item(&c, p)?.id.clone()),
+                None => None,
+            };
+            let request = build_request(&target, &req)?;
+            c.add_item(pid.as_deref(), Item::request(&name, request))?;
+            ws.save_collection(&c)?;
+            println!("added request `{name}`");
+        }
+        CollectionCmd::Remove { collection, item } => {
+            let mut c = stored(ws, &collection)?;
+            let id = resolve_item(&c, &item)?.id.clone();
+            c.remove_item(&id);
+            ws.save_collection(&c)?;
+            println!("removed `{item}`");
+        }
+        CollectionCmd::Move { collection, item, to, index } => {
+            let mut c = stored(ws, &collection)?;
+            let id = resolve_item(&c, &item)?.id.clone();
+            let pid = match &to {
+                Some(p) => Some(resolve_item(&c, p)?.id.clone()),
+                None => None,
+            };
+            c.move_item(&id, pid.as_deref(), index)?;
+            ws.save_collection(&c)?;
+            println!("moved `{item}`");
+        }
+        CollectionCmd::RenameItem { collection, item, name } => {
+            let mut c = stored(ws, &collection)?;
+            let id = resolve_item(&c, &item)?.id.clone();
+            c.find_mut(&id).expect("resolved").name = name.clone();
+            ws.save_collection(&c)?;
+            println!("renamed to `{name}`");
+        }
+        CollectionCmd::SetVar { collection, key, value } => {
+            let mut c = stored(ws, &collection)?;
+            let mut vars = c.variables();
+            vars.insert(key.clone(), value);
+            c.set_variables(&vars);
+            ws.save_collection(&c)?;
+            println!("set {key}");
+        }
+        CollectionCmd::UnsetVar { collection, key } => {
+            let mut c = stored(ws, &collection)?;
+            c.variable.retain(|v| v.key != key);
+            ws.save_collection(&c)?;
+            println!("unset {key}");
+        }
+        CollectionCmd::SetAuth { collection, item, kind, params } => {
+            let mut c = stored(ws, &collection)?;
+            let auth = build_auth(&kind, &params)?;
+            match item {
+                None => c.auth = auth,
+                Some(i) => {
+                    let id = resolve_item(&c, &i)?.id.clone();
+                    let it = c.find_mut(&id).expect("resolved");
+                    match it.request.as_mut() {
+                        Some(r) => r.auth = auth,
+                        None => it.auth = auth,
+                    }
+                }
+            }
+            ws.save_collection(&c)?;
+            println!("auth set to {kind}");
+        }
+    }
+    Ok(0)
+}
+
+fn stored_env(ws: &Workspace, reference: &str) -> Result<Environment> {
+    let e = ws.find_environment(reference)?;
+    if ws.environment(&e.id)?.is_none() {
+        bail!("`{reference}` is a file, not a workspace environment; run `rspostman import {reference}` first");
+    }
+    Ok(e)
+}
+
+fn env_cmd(ws: &Workspace, cmd: EnvCmd) -> Result<i32> {
+    match cmd {
+        EnvCmd::List => {
+            let active = ws.state()?.active_environment;
+            let rows: Vec<Vec<String>> = ws
+                .environments()?
+                .iter()
+                .map(|e| vec![if active.as_deref() == Some(&e.id) { "*".into() } else { String::new() }, e.name.clone(), e.values.len().to_string(), e.id.clone()])
+                .collect();
+            if rows.is_empty() {
+                println!("No environments yet. Create one with `rspostman env create <name>`.");
+            } else {
+                out::table(&["", "NAME", "VARS", "ID"], &rows);
+            }
+        }
+        EnvCmd::Create { name } => {
+            let e = Environment::new(&name);
+            ws.save_environment(&e)?;
+            println!("created environment `{name}` ({})", e.id);
+        }
+        EnvCmd::Show { env } => {
+            let e = ws.find_environment(&env)?;
+            println!("{}  {}", out::bold(&e.name), out::dim(&e.id));
+            print_vars(e.values.iter().map(|v| (v.key.clone(), v.value.clone(), v.enabled)).collect());
+        }
+        EnvCmd::Delete { env } => {
+            let e = stored_env(ws, &env)?;
+            ws.delete_environment(&e.id)?;
+            println!("deleted environment `{}`", e.name);
+        }
+        EnvCmd::Rename { env, name } => {
+            let mut e = stored_env(ws, &env)?;
+            e.name = name.clone();
+            ws.save_environment(&e)?;
+            println!("renamed to `{name}`");
+        }
+        EnvCmd::Set { env, key, value } => {
+            let mut e = stored_env(ws, &env)?;
+            e.set(&key, &value);
+            ws.save_environment(&e)?;
+            println!("set {key}");
+        }
+        EnvCmd::Unset { env, key } => {
+            let mut e = stored_env(ws, &env)?;
+            if !e.unset(&key) {
+                bail!("variable `{key}` not found");
+            }
+            ws.save_environment(&e)?;
+            println!("unset {key}");
+        }
+        EnvCmd::Use { env } => {
+            let mut st = ws.state()?;
+            if env == "none" {
+                st.active_environment = None;
+                println!("no active environment");
+            } else {
+                let e = stored_env(ws, &env)?;
+                println!("active environment: {}", e.name);
+                st.active_environment = Some(e.id);
+            }
+            ws.save_state(&st)?;
+        }
+    }
+    Ok(0)
+}
+
+fn settings_cmd(ws: &Workspace, cmd: SettingsCmd) -> Result<i32> {
+    match cmd {
+        SettingsCmd::Show => println!("{}", serde_json::to_string_pretty(&ws.settings()?)?),
+        SettingsCmd::Reset => {
+            ws.save_settings(&Settings::default())?;
+            println!("settings reset");
+        }
+        SettingsCmd::Set { key, value } => {
+            let mut v = serde_json::to_value(ws.settings()?)?;
+            let slot = v.get_mut(&key).ok_or_else(|| anyhow!("unknown setting `{key}`; see `rspostman settings show`"))?;
+            *slot = match slot {
+                serde_json::Value::Bool(_) => serde_json::Value::Bool(match value.as_str() {
+                    "true" | "on" | "yes" | "1" => true,
+                    "false" | "off" | "no" | "0" => false,
+                    _ => bail!("`{key}` expects true or false"),
+                }),
+                serde_json::Value::Number(_) => serde_json::json!(value.parse::<u64>().map_err(|_| anyhow!("`{key}` expects a number"))?),
+                _ => serde_json::Value::String(value),
+            };
+            ws.save_settings(&serde_json::from_value(v)?)?;
+            println!("{key} updated");
+        }
+    }
+    Ok(0)
+}
+
+fn import_cmd(ws: &Workspace, source: String, collection: Option<String>, name: Option<String>) -> Result<i32> {
+    let text = if source == "-" {
+        std::io::read_to_string(std::io::stdin())?
+    } else if std::path::Path::new(&source).is_file() {
+        std::fs::read_to_string(&source).with_context(|| format!("cannot read {source}"))?
+    } else if source.trim_start().starts_with("curl") {
+        source.clone()
+    } else {
+        bail!("`{source}` is neither a file nor a curl command");
+    };
+    match rspostman_core::import::parse(&text)? {
+        Imported::Collection(c) => {
+            let c = ws.import_collection(c)?;
+            println!("imported collection `{}` with {} requests ({})", c.info.name, c.requests().len(), c.id());
+        }
+        Imported::Environment(mut e) => {
+            if ws.environment(&e.id)?.is_some() {
+                e.id = rspostman_core::model::new_id();
+            }
+            ws.save_environment(&e)?;
+            println!("imported environment `{}` with {} variables", e.name, e.values.len());
+        }
+        Imported::Globals(g) => {
+            let mut cur = ws.globals()?;
+            for v in g.values.iter().filter(|v| v.enabled) {
+                cur.set(&v.key, &v.value);
+            }
+            ws.save_globals(&cur)?;
+            println!("merged {} global variables", g.values.len());
+        }
+        Imported::Request(r) => {
+            let target = collection.unwrap_or_else(|| "Imported".into());
+            let mut c = match ws.find_collection(&target) {
+                Ok(c) if ws.collection(c.id())?.is_some() => c,
+                _ => Collection::new(&target),
+            };
+            let name = name.unwrap_or_else(|| format!("{} {}", r.method, r.url.base()));
+            c.add_item(None, Item::request(&name, r))?;
+            ws.save_collection(&c)?;
+            println!("imported request `{name}` into collection `{}`", c.info.name);
+        }
+    }
+    Ok(0)
+}
+
+fn run(cli: Cli) -> Result<i32> {
+    let ws = Workspace::open(cli.workspace.clone())?;
+    match cli.cmd {
+        Cmd::Send { target, req, exec } => {
+            let request = build_request(&target, &req)?;
+            let mut s = Session::load(&ws, None, exec.env.as_deref())?;
+            apply_exec(&mut s, &exec)?;
+            let ex = s.send("", &request, request.auth.as_ref());
+            if !exec.no_history {
+                engine::record(&ws, &s.settings, &ex, Some(&request), None)?;
+            }
+            s.persist(&ws, None)?;
+            report(&ex, &exec)
+        }
+        Cmd::Request { collection, request, exec } => {
+            let mut c = ws.find_collection(&collection)?;
+            let id = resolve_item(&c, &request)?.id.clone();
+            let mut s = Session::load(&ws, Some(&c), exec.env.as_deref())?;
+            apply_exec(&mut s, &exec)?;
+            let ex = s.send_item(&c, &id);
+            if !exec.no_history {
+                engine::record(&ws, &s.settings, &ex, c.find(&id).and_then(|i| i.request.as_ref()), Some(c.id()))?;
+            }
+            s.persist(&ws, Some(&mut c))?;
+            report(&ex, &exec)
+        }
+        Cmd::Collection(cmd) => collection_cmd(&ws, cmd),
+        Cmd::Env(cmd) => env_cmd(&ws, cmd),
+        Cmd::Globals(cmd) => {
+            let mut g = ws.globals()?;
+            match cmd {
+                VarCmd::List => print_vars(g.values.iter().map(|v| (v.key.clone(), v.value.clone(), v.enabled)).collect()),
+                VarCmd::Set { key, value } => {
+                    g.set(&key, &value);
+                    ws.save_globals(&g)?;
+                    println!("set {key}");
+                }
+                VarCmd::Unset { key } => {
+                    if !g.unset(&key) {
+                        bail!("variable `{key}` not found");
+                    }
+                    ws.save_globals(&g)?;
+                    println!("unset {key}");
+                }
+            }
+            Ok(0)
+        }
+        Cmd::History(cmd) => match cmd {
+            HistoryCmd::List { limit } => {
+                let h = ws.history()?;
+                let rows: Vec<Vec<String>> = h
+                    .iter()
+                    .rev()
+                    .take(limit)
+                    .enumerate()
+                    .map(|(i, e)| {
+                        let (m, u) = e.request.as_ref().map(|p| (p.method.clone(), p.url.clone())).unwrap_or_default();
+                        let st = match (&e.response, &e.error) {
+                            (Some(r), _) => r.status.to_string(),
+                            (None, Some(_)) => "ERR".into(),
+                            _ => "-".into(),
+                        };
+                        vec![(i + 1).to_string(), e.timestamp.with_timezone(&chrono_local()).format("%Y-%m-%d %H:%M:%S").to_string(), st, m, u]
+                    })
+                    .collect();
+                if rows.is_empty() {
+                    println!("History is empty.");
+                } else {
+                    out::table(&["#", "TIME", "STATUS", "METHOD", "URL"], &rows);
+                }
+                Ok(0)
+            }
+            HistoryCmd::Show { entry } => {
+                let e = ws.history_entry(&entry)?;
+                let ex = Exchange { id: e.id, item_id: e.item_id, name: e.name.unwrap_or_default(), request: e.request, response: e.response, error: e.error };
+                report(&ex, &ExecArgs { verbose: true, ..Default::default() })
+            }
+            HistoryCmd::Replay { entry, exec } => {
+                let e = ws.history_entry(&entry)?;
+                let source = e.source.ok_or_else(|| anyhow!("history entry has no replayable request"))?;
+                let collection = match &e.collection_id {
+                    Some(id) => ws.collection(id)?,
+                    None => None,
+                };
+                let mut s = Session::load(&ws, collection.as_ref(), exec.env.as_deref())?;
+                apply_exec(&mut s, &exec)?;
+                let auth = match (&collection, &e.item_id) {
+                    (Some(c), Some(id)) if source.auth.is_none() => c.effective_auth(id),
+                    _ => source.auth.clone(),
+                };
+                let mut ex = s.send(e.name.as_deref().unwrap_or(""), &source, auth.as_ref());
+                ex.item_id = e.item_id.clone();
+                if !exec.no_history {
+                    engine::record(&ws, &s.settings, &ex, Some(&source), e.collection_id.as_deref())?;
+                }
+                s.persist(&ws, None)?;
+                report(&ex, &exec)
+            }
+            HistoryCmd::Clear => {
+                ws.clear_history()?;
+                println!("history cleared");
+                Ok(0)
+            }
+        },
+        Cmd::Cookies(cmd) => {
+            let mut jar = ws.cookies()?;
+            match cmd {
+                CookiesCmd::List => {
+                    let rows: Vec<Vec<String>> = jar
+                        .cookies
+                        .iter()
+                        .map(|c| {
+                            vec![
+                                c.domain.clone(),
+                                c.path.clone(),
+                                c.name.clone(),
+                                c.value.clone(),
+                                c.expires.map(|e| e.format("%Y-%m-%d %H:%M").to_string()).unwrap_or_else(|| "session".into()),
+                            ]
+                        })
+                        .collect();
+                    if rows.is_empty() {
+                        println!("Cookie jar is empty.");
+                    } else {
+                        out::table(&["DOMAIN", "PATH", "NAME", "VALUE", "EXPIRES"], &rows);
+                    }
+                }
+                CookiesCmd::Set { url, cookie } => {
+                    let u = url::Url::parse(&url).map_err(|e| anyhow!("invalid URL `{url}`: {e}"))?;
+                    let c = jar.store_header(&cookie, &u).ok_or_else(|| anyhow!("cannot parse cookie `{cookie}` (expected `name=value; attributes`)"))?;
+                    ws.save_cookies(&jar)?;
+                    println!("stored cookie {} for {}", c.name, c.domain);
+                }
+                CookiesCmd::Clear { domain, name } => {
+                    let n = match domain {
+                        Some(d) => jar.remove(&d, name.as_deref()),
+                        None => std::mem::take(&mut jar.cookies).len(),
+                    };
+                    ws.save_cookies(&jar)?;
+                    println!("removed {n} cookie(s)");
+                }
+            }
+            Ok(0)
+        }
+        Cmd::Import { source, collection, name } => import_cmd(&ws, source, collection, name),
+        Cmd::Export(cmd) => {
+            match cmd {
+                ExportCmd::Collection { collection, output } => write_out(&ws.find_collection(&collection)?.to_json(), &output)?,
+                ExportCmd::Env { env, output } => write_out(&ws.find_environment(&env)?.to_json(), &output)?,
+                ExportCmd::Globals { output } => write_out(&ws.globals()?.to_json(), &output)?,
+            }
+            Ok(0)
+        }
+        Cmd::Codegen { lang, list, collection, request, target, req, env } => {
+            if list {
+                out::table(&["ID", "LANGUAGE"], &codegen::LANGUAGES.iter().map(|(i, n)| vec![i.to_string(), n.to_string()]).collect::<Vec<_>>());
+                return Ok(0);
+            }
+            let prepared = match (collection, request) {
+                (Some(cr), Some(rr)) => {
+                    let c = ws.find_collection(&cr)?;
+                    let item = resolve_item(&c, &rr)?;
+                    let r = item.request.as_ref().ok_or_else(|| anyhow!("`{rr}` is a folder"))?;
+                    let s = Session::load(&ws, Some(&c), env.as_deref())?;
+                    rspostman_core::http::prepare(r, c.effective_auth(&item.id).as_ref(), &s.scopes)?
+                }
+                _ => {
+                    if target.is_empty() {
+                        bail!("give either --collection/--request or `[METHOD] URL`");
+                    }
+                    let r = build_request(&target, &req)?;
+                    let s = Session::load(&ws, None, env.as_deref())?;
+                    rspostman_core::http::prepare(&r, r.auth.as_ref(), &s.scopes)?
+                }
+            };
+            println!("{}", codegen::generate(&lang, &prepared)?);
+            Ok(0)
+        }
+        Cmd::Settings(cmd) => settings_cmd(&ws, cmd),
+        Cmd::Echo { port, host } => {
+            let srv = rspostman_core::echo::start(&host, port)?;
+            eprintln!("echo server listening on {}  (Ctrl-C to stop)", srv.url());
+            srv.join();
+            Ok(0)
+        }
+    }
+}
+
+fn chrono_local() -> chrono::Local {
+    chrono::Local
+}
+
+fn main() {
+    let cli = Cli::parse();
+    out::init(cli.no_color);
+    match run(cli) {
+        Ok(code) => std::process::exit(code),
+        Err(e) => {
+            eprintln!("{} {e:#}", out::red("error:"));
+            std::process::exit(1);
+        }
+    }
+}

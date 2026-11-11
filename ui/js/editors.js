@@ -114,5 +114,5 @@ views.environment = (tab) => {
       h("span.muted", isGlobals ? "Global variables are available in every request, whatever environment is active." : "Use variables as {{name}} in URLs, headers, bodies and scripts.")),
     kvEditor(env.values, { enabledKey: "enabled", onChange: dirty, keyLabel: "Variable", testid: "environment-variables", secretType: true }),
     h("p.hint", "Precedence when names clash: local → iteration data → environment → collection → globals."),
-    h("p.hint", "Tick “Secret” for passwords, tokens and keys: the value is masked here and in CLI listings. Values are stored unencrypted in the workspace folder, which only your user account can read."));
+    h("p.hint", "Tick “Secret” for passwords, tokens and keys: the value is masked here and in CLI listings. Variables are stored unencrypted in the workspace folder (readable by your user account only) – for encryption at rest, put the value in the vault and set the variable to {{vault:name}}."));
 };

@@ -4,6 +4,7 @@ import { state, views, requestActions, emit, collectionById, saveCollection, mar
 import { h, clear, toast, guard, modal, kvEditor, cleanRows, tabStrip, highlightJson, prettyJson, prettyXml, humanSize, humanTime, statusClass, download, b64ToBytes, copyText, promptDialog, confirmDialog, uuid, clone, esc, isSensitiveName } from "./util.js";
 import { METHODS, syncFromRaw, syncFromQuery, findItem, folders, setScript } from "./model.js";
 import { authEditor } from "./authui.js";
+import { openVault } from "./vault.js";
 
 const SNIPPETS = {
   pre: [
@@ -381,7 +382,8 @@ views.request = (tab) => {
     let body;
     const t = tab.resTab;
     if (t === "body") {
-      if (ex.error) body = h("div.error-box", { testid: "response-error", role: "alert" }, h("b", "Could not get a response"), ex.error);
+      if (ex.error) body = h("div.error-box", { testid: "response-error", role: "alert" }, h("b", "Could not get a response"), ex.error,
+        /vault secret .* is not available/.test(ex.error) ? h("div", { style: "margin-top:10px" }, h("button.btn", { testid: "error-open-vault", onClick: openVault }, state.vault.exists ? (state.vault.unlocked ? "Open the vault" : "Unlock the vault") : "Set up the vault")) : null);
       else if (ex.skipped) body = h("div.placeholder", "The request was skipped by pm.execution.skipRequest().");
       else body = bodyView(r);
     } else if (t === "headers") {

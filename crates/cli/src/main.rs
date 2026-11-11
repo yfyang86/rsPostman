@@ -380,6 +380,9 @@ enum Cmd {
         #[arg(long)]
         no_open: bool,
     },
+    /// Encrypted local vault for secrets, referenced in requests as `{{vault:NAME}}`
+    #[command(subcommand)]
+    Vault(VaultCmd),
     /// Show or change settings
     #[command(subcommand)]
     Settings(SettingsCmd),
@@ -542,6 +545,27 @@ enum ExportCmd {
 }
 
 #[derive(Subcommand)]
+enum VaultCmd {
+    /// Create the vault (asks for a new passphrase, or takes it from RSPOSTMAN_VAULT_PASSPHRASE)
+    Init,
+    /// Show whether a vault exists and how many secrets it holds
+    Status,
+    /// List secret names (does not need the passphrase)
+    #[command(alias = "ls")]
+    List,
+    /// Store a secret; omit VALUE to be asked for it without echo (or pipe it on stdin).
+    /// Creates the vault on first use
+    Set { name: String, value: Option<String> },
+    /// Print a secret
+    Get { name: String },
+    /// Delete a secret
+    #[command(alias = "rm")]
+    Remove { name: String },
+    /// Change the passphrase (the new one is asked for, or taken from RSPOSTMAN_VAULT_NEW_PASSPHRASE)
+    Passwd,
+}
+
+#[derive(Subcommand)]
 enum SettingsCmd {
     Show,
     /// Set a value, e.g. `settings set timeout_ms 5000`
@@ -574,6 +598,129 @@ fn prompt_secret(what: &str) -> Result<String> {
         bail!("no {what} given (stdin was empty)");
     }
     Ok(value)
+}
+
+const VAULT_ENV: &str = "RSPOSTMAN_VAULT_PASSPHRASE";
+const VAULT_NEW_ENV: &str = "RSPOSTMAN_VAULT_NEW_PASSPHRASE";
+
+/// The vault passphrase: environment variable, else a hidden prompt on a terminal.
+/// It is never read from piped stdin, which may carry a secret value instead.
+fn vault_passphrase(env: &str, prompt: &str) -> Result<String> {
+    use std::io::IsTerminal;
+    if let Ok(p) = std::env::var(env) {
+        return Ok(p);
+    }
+    if !std::io::stdin().is_terminal() {
+        bail!("the vault passphrase is needed: set {env} or run in a terminal to be asked for it");
+    }
+    rpassword::prompt_password(format!("{prompt}: ")).context("cannot read the passphrase")
+}
+
+/// A passphrase for a new vault: from the environment, or asked twice.
+fn new_vault_passphrase(env: &str) -> Result<String> {
+    use std::io::IsTerminal;
+    if let Ok(p) = std::env::var(env) {
+        return Ok(p);
+    }
+    if !std::io::stdin().is_terminal() {
+        bail!("a new vault passphrase is needed: set {env} or run in a terminal to be asked for it");
+    }
+    let first = rpassword::prompt_password("New vault passphrase: ").context("cannot read the passphrase")?;
+    let second = rpassword::prompt_password("Repeat the passphrase: ").context("cannot read the passphrase")?;
+    if first != second {
+        bail!("the passphrases do not match");
+    }
+    Ok(first)
+}
+
+fn open_vault(ws: &Workspace) -> Result<rspostman_core::vault::Vault> {
+    if !rspostman_core::vault::exists(ws) {
+        bail!("this workspace has no vault yet; create one with `rspostman vault init` or `rspostman vault set NAME`");
+    }
+    rspostman_core::vault::Vault::unlock(ws, &vault_passphrase(VAULT_ENV, "Vault passphrase")?)
+}
+
+/// Load a session and, when anything refers to `{{vault:…}}` (the collection, variables or
+/// the command line itself), unlock the vault for it.
+fn load_session(ws: &Workspace, collection: Option<&Collection>, env: Option<&str>) -> Result<Session> {
+    let mut session = Session::load(ws, collection, env)?;
+    let mut text = std::env::args().collect::<Vec<_>>().join("\n");
+    if let Some(c) = collection {
+        text.push_str(&c.to_json());
+    }
+    for scope in [&session.scopes.globals, &session.scopes.collection, &session.scopes.environment] {
+        for v in scope.values() {
+            text.push_str(v);
+            text.push('\n');
+        }
+    }
+    if !rspostman_core::vault::references(&text).is_empty() {
+        session.unlock_vault(&open_vault(ws)?)?;
+    }
+    Ok(session)
+}
+
+fn vault_cmd(ws: &Workspace, cmd: VaultCmd) -> Result<i32> {
+    use rspostman_core::vault::{self, Vault};
+    match cmd {
+        VaultCmd::Init => {
+            if vault::exists(ws) {
+                bail!("a vault already exists in this workspace (use `rspostman vault passwd` to change its passphrase)");
+            }
+            Vault::create(ws, &new_vault_passphrase(VAULT_ENV)?)?;
+            println!("vault created at {}", vault::path(ws).display());
+            println!("There is no way to recover the passphrase: keep it somewhere safe.");
+        }
+        VaultCmd::Status => {
+            if vault::exists(ws) {
+                println!("vault: {} ({} secret(s), locked until the passphrase is given)", vault::path(ws).display(), vault::names(ws)?.len());
+            } else {
+                println!("no vault in this workspace; create one with `rspostman vault init`");
+            }
+        }
+        VaultCmd::List => {
+            let names = vault::names(ws)?;
+            if names.is_empty() {
+                println!("{}", if vault::exists(ws) { "The vault is empty." } else { "No vault in this workspace." });
+            }
+            for n in names {
+                println!("{n}");
+            }
+        }
+        VaultCmd::Set { name, value } => {
+            if !vault::valid_name(&name) {
+                bail!("invalid secret name `{name}` (use letters, digits, `_`, `-` and `.`)");
+            }
+            let mut v = if vault::exists(ws) {
+                open_vault(ws)?
+            } else {
+                eprintln!("No vault yet – creating one.");
+                Vault::create(ws, &new_vault_passphrase(VAULT_ENV)?)?
+            };
+            let value = match value {
+                Some(v) => v,
+                None => prompt_secret(&format!("value for {name}"))?,
+            };
+            v.set(&name, &value)?;
+            println!("stored `{name}`; use it as {{{{vault:{name}}}}}");
+        }
+        VaultCmd::Get { name } => match open_vault(ws)?.get(&name)? {
+            Some(v) => println!("{v}"),
+            None => bail!("the vault has no secret named `{name}`"),
+        },
+        VaultCmd::Remove { name } => {
+            if !open_vault(ws)?.remove(&name)? {
+                bail!("the vault has no secret named `{name}`");
+            }
+            println!("removed `{name}`");
+        }
+        VaultCmd::Passwd => {
+            let mut v = open_vault(ws)?;
+            v.change_passphrase(&new_vault_passphrase(VAULT_NEW_ENV)?)?;
+            println!("passphrase changed; all secrets were re-encrypted");
+        }
+    }
+    Ok(0)
 }
 
 /// Resolve a credential argument so that it does not have to appear on the command line:
@@ -771,7 +918,7 @@ fn print_script_results(ex: &Exchange, console: bool) {
 }
 
 fn load_run(ws: &Workspace, collection: &Collection, a: &RunArgs) -> Result<(Session, rspostman_core::runner::RunOptions)> {
-    let mut session = Session::load(ws, Some(collection), a.env.as_deref())?;
+    let mut session = load_session(ws, Some(collection), a.env.as_deref())?;
     for v in &a.vars {
         let (k, val) = kv(v, '=', "--var")?;
         session.scopes.local.insert(k, val);
@@ -1328,11 +1475,11 @@ fn run(cli: Cli) -> Result<i32> {
     match cli.cmd {
         Cmd::Send { target, req, exec } => {
             let request = build_request(&target, &req)?;
-            let mut s = Session::load(&ws, None, exec.env.as_deref())?;
+            let mut s = load_session(&ws, None, exec.env.as_deref())?;
             apply_exec(&mut s, &exec)?;
             let ex = s.send("", &request, request.auth.as_ref());
             if !exec.no_history {
-                engine::record(&ws, &s.settings, &ex, Some(&request), None)?;
+                engine::record(&ws, &s, &ex, Some(&request), None)?;
             }
             s.persist(&ws, None)?;
             report(&ex, &exec)
@@ -1340,11 +1487,11 @@ fn run(cli: Cli) -> Result<i32> {
         Cmd::Request { collection, request, exec } => {
             let mut c = ws.find_collection(&collection)?;
             let id = resolve_item(&c, &request)?.id.clone();
-            let mut s = Session::load(&ws, Some(&c), exec.env.as_deref())?;
+            let mut s = load_session(&ws, Some(&c), exec.env.as_deref())?;
             apply_exec(&mut s, &exec)?;
             let ex = s.send_item(&c, &id);
             if !exec.no_history {
-                engine::record(&ws, &s.settings, &ex, c.find(&id).and_then(|i| i.request.as_ref()), Some(c.id()))?;
+                engine::record(&ws, &s, &ex, c.find(&id).and_then(|i| i.request.as_ref()), Some(c.id()))?;
             }
             s.persist(&ws, Some(&mut c))?;
             report(&ex, &exec)
@@ -1420,7 +1567,7 @@ fn run(cli: Cli) -> Result<i32> {
                         ),
                     }
                 }
-                let mut s = Session::load(&ws, collection.as_ref(), exec.env.as_deref())?;
+                let mut s = load_session(&ws, collection.as_ref(), exec.env.as_deref())?;
                 apply_exec(&mut s, &exec)?;
                 let auth = match (&collection, &e.item_id) {
                     (Some(c), Some(id)) if source.auth.is_none() => c.effective_auth(id),
@@ -1429,7 +1576,7 @@ fn run(cli: Cli) -> Result<i32> {
                 let mut ex = s.send(e.name.as_deref().unwrap_or(""), &source, auth.as_ref());
                 ex.item_id = e.item_id.clone();
                 if !exec.no_history {
-                    engine::record(&ws, &s.settings, &ex, Some(&source), e.collection_id.as_deref())?;
+                    engine::record(&ws, &s, &ex, Some(&source), e.collection_id.as_deref())?;
                 }
                 s.persist(&ws, None)?;
                 report(&ex, &exec)
@@ -1499,7 +1646,7 @@ fn run(cli: Cli) -> Result<i32> {
                     let c = ws.find_collection(&cr)?;
                     let item = resolve_item(&c, &rr)?;
                     let r = item.request.as_ref().ok_or_else(|| anyhow!("`{rr}` is a folder"))?;
-                    let s = Session::load(&ws, Some(&c), env.as_deref())?;
+                    let s = load_session(&ws, Some(&c), env.as_deref())?;
                     rspostman_core::http::prepare(r, c.effective_auth(&item.id).as_ref(), &s.scopes)?
                 }
                 _ => {
@@ -1507,7 +1654,7 @@ fn run(cli: Cli) -> Result<i32> {
                         bail!("give either --collection/--request or `[METHOD] URL`");
                     }
                     let r = build_request(&target, &req)?;
-                    let s = Session::load(&ws, None, env.as_deref())?;
+                    let s = load_session(&ws, None, env.as_deref())?;
                     rspostman_core::http::prepare(&r, r.auth.as_ref(), &s.scopes)?
                 }
             };
@@ -1583,12 +1730,12 @@ fn run(cli: Cli) -> Result<i32> {
         }
         Cmd::Benchmark { collection, request, folder, target, req, env, iterations, concurrency, delay, insecure, timeout, report_json, quiet } => {
             use rspostman_core::profile;
-            let mut session = Session::load(&ws, None, env.as_deref())?;
+            let mut session = load_session(&ws, None, env.as_deref())?;
             let mut tasks: Vec<profile::BenchTask> = vec![];
             match &collection {
                 Some(cr) => {
                     let c = ws.find_collection(cr)?;
-                    session = Session::load(&ws, Some(&c), env.as_deref())?;
+                    session = load_session(&ws, Some(&c), env.as_deref())?;
                     let all = c.requests();
                     let list: Vec<(String, &Item)> = match (&request, &folder) {
                         (Some(r), _) => {
@@ -1680,7 +1827,7 @@ fn run(cli: Cli) -> Result<i32> {
                     }
                 }
             }
-            let mut session = Session::load(&ws, None, env.as_deref())?;
+            let mut session = load_session(&ws, None, env.as_deref())?;
             if insecure {
                 session.settings.verify_ssl = false;
             }
@@ -1699,7 +1846,7 @@ fn run(cli: Cli) -> Result<i32> {
         }
         Cmd::Mock { collection, port, host, env, delay, no_cors } => {
             let c = ws.find_collection(&collection)?;
-            let session = Session::load(&ws, Some(&c), env.as_deref())?;
+            let session = load_session(&ws, Some(&c), env.as_deref())?;
             let (srv, routes) = rspostman_core::mock::start(
                 &c,
                 session.scopes,
@@ -1759,7 +1906,7 @@ fn run(cli: Cli) -> Result<i32> {
             Ok(if failures > 0 { 1 } else { 0 })
         }
         Cmd::Ws { url, headers, messages, wait, env } => {
-            let session = Session::load(&ws, None, env.as_deref())?;
+            let session = load_session(&ws, None, env.as_deref())?;
             let mut hs = vec![];
             for h in &headers {
                 let (k, v) = kv(h, ':', "header")?;
@@ -1849,6 +1996,7 @@ fn run(cli: Cli) -> Result<i32> {
             srv.join();
             Ok(0)
         }
+        Cmd::Vault(cmd) => vault_cmd(&ws, cmd),
         Cmd::Settings(cmd) => settings_cmd(&ws, cmd),
         Cmd::Echo { port, host } => {
             let srv = rspostman_core::echo::start(&host, port)?;

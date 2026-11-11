@@ -71,6 +71,8 @@ pub struct App {
     runs: Mutex<HashMap<String, Arc<Mutex<RunEntry>>>>,
     profiles: Mutex<HashMap<String, Arc<Mutex<ProfileEntry>>>>,
     benchmarks: Mutex<HashMap<String, Arc<Mutex<BenchEntry>>>>,
+    /// The unlocked vault (key in memory) – `None` while locked. Dropped on lock and on exit.
+    vault: Mutex<Option<rspostman_core::vault::Vault>>,
 }
 
 fn mime(path: &str) -> &'static str {
@@ -154,7 +156,7 @@ fn yes() -> bool {
 
 impl App {
     pub fn new(ws: Workspace) -> Arc<App> {
-        Arc::new(App { ws, port: Default::default(), sockets: Default::default(), mocks: Default::default(), runs: Default::default(), profiles: Default::default(), benchmarks: Default::default() })
+        Arc::new(App { ws, port: Default::default(), sockets: Default::default(), mocks: Default::default(), runs: Default::default(), profiles: Default::default(), benchmarks: Default::default(), vault: Default::default() })
     }
 
     fn collection(&self, id: &str) -> Result<Collection> {
@@ -162,23 +164,37 @@ impl App {
     }
 
     fn session(&self, collection: Option<&Collection>, environment_id: &Option<String>) -> Result<Session> {
-        match environment_id.as_deref() {
+        let mut s = match environment_id.as_deref() {
             // an explicit empty id means "no environment"
             Some("") => {
                 let mut s = Session::load(&self.ws, collection, None)?;
                 s.environment = None;
                 s.scopes.environment.clear();
-                Ok(s)
+                s
             }
-            Some(id) => Session::load(&self.ws, collection, Some(id)),
-            None => Session::load(&self.ws, collection, None),
+            Some(id) => Session::load(&self.ws, collection, Some(id))?,
+            None => Session::load(&self.ws, collection, None)?,
+        };
+        if let Some(v) = self.vault.lock().map_err(|_| anyhow!("lock poisoned"))?.as_ref() {
+            s.unlock_vault(v)?;
         }
+        Ok(s)
+    }
+
+    fn vault_status(&self) -> Result<Value> {
+        let unlocked = self.vault.lock().map_err(|_| anyhow!("lock poisoned"))?.is_some();
+        Ok(json!({
+            "exists": rspostman_core::vault::exists(&self.ws),
+            "unlocked": unlocked,
+            "names": rspostman_core::vault::names(&self.ws)?,
+        }))
     }
 
     fn bootstrap(&self) -> Result<Value> {
         Ok(json!({
             "version": env!("CARGO_PKG_VERSION"),
             "workspace": self.ws.root.display().to_string(),
+            "vault": self.vault_status()?,
             "collections": self.ws.collections()?,
             "environments": self.ws.environments()?,
             "globals": self.ws.globals()?,
@@ -241,7 +257,7 @@ impl App {
             let mut source = b.request.clone();
             // keep request-level scripts replayable from the history
             let _ = &mut source;
-            engine::record(&self.ws, &session.settings, &ex, Some(&source), b.collection_id.as_deref())?;
+            engine::record(&self.ws, &session, &ex, Some(&source), b.collection_id.as_deref())?;
         }
         let mut v = exchange_json(&ex);
         v["scripts"] = json!({"prerequest": b.prerequest, "test": b.test});
@@ -617,7 +633,8 @@ impl App {
                     None => None,
                 };
                 let env = body.get("environment_id").and_then(|e| e.as_str()).map(|s| s.to_string());
-                let session = self.session(collection.as_ref(), &env)?;
+                let mut session = self.session(collection.as_ref(), &env)?;
+                session.scopes.vault.clear(); // a preview must not reveal vault secrets
                 let text = body["text"].as_str().unwrap_or("");
                 ok(json!({"resolved": session.scopes.resolve(text), "unresolved": session.scopes.unresolved(text)}))
             }
@@ -673,6 +690,52 @@ impl App {
             ("DELETE", ["history"]) => {
                 self.ws.clear_history()?;
                 ok(json!({"deleted": true}))
+            }
+
+            // ---------------------------------------------------------- vault
+            // Secret values only ever travel browser -> server; no endpoint returns one.
+            ("GET", ["vault"]) => ok(self.vault_status()?),
+            ("POST", ["vault", "create"]) => {
+                let body: Value = req.json()?;
+                let v = rspostman_core::vault::Vault::create(&self.ws, body["passphrase"].as_str().unwrap_or("")).map_err(|e| anyhow!("400:{e}"))?;
+                *self.vault.lock().map_err(|_| lock_err())? = Some(v);
+                ok(self.vault_status()?)
+            }
+            ("POST", ["vault", "unlock"]) => {
+                let body: Value = req.json()?;
+                let v = rspostman_core::vault::Vault::unlock(&self.ws, body["passphrase"].as_str().unwrap_or("")).map_err(|e| anyhow!("400:{e}"))?;
+                *self.vault.lock().map_err(|_| lock_err())? = Some(v);
+                ok(self.vault_status()?)
+            }
+            ("POST", ["vault", "lock"]) => {
+                *self.vault.lock().map_err(|_| lock_err())? = None;
+                ok(self.vault_status()?)
+            }
+            ("POST", ["vault", "passphrase"]) => {
+                let body: Value = req.json()?;
+                // the current passphrase is checked again even when the vault is unlocked
+                let mut v = rspostman_core::vault::Vault::unlock(&self.ws, body["current"].as_str().unwrap_or("")).map_err(|e| anyhow!("400:{e}"))?;
+                v.change_passphrase(body["new"].as_str().unwrap_or("")).map_err(|e| anyhow!("400:{e}"))?;
+                *self.vault.lock().map_err(|_| lock_err())? = Some(v);
+                ok(self.vault_status()?)
+            }
+            ("PUT", ["vault", "secrets", name]) => {
+                let body: Value = req.json()?;
+                let value = body["value"].as_str().ok_or_else(|| anyhow!("400:value is required"))?;
+                let mut guard = self.vault.lock().map_err(|_| lock_err())?;
+                let v = guard.as_mut().ok_or_else(|| anyhow!("400:the vault is locked"))?;
+                v.set(name, value).map_err(|e| anyhow!("400:{e}"))?;
+                drop(guard);
+                ok(self.vault_status()?)
+            }
+            ("DELETE", ["vault", "secrets", name]) => {
+                let mut guard = self.vault.lock().map_err(|_| lock_err())?;
+                let v = guard.as_mut().ok_or_else(|| anyhow!("400:the vault is locked"))?;
+                if !v.remove(name)? {
+                    return Err(not_found("secret"));
+                }
+                drop(guard);
+                ok(self.vault_status()?)
             }
 
             // ---------------------------------------------------------- cookies
@@ -749,7 +812,8 @@ impl App {
                 let body: Value = req.json()?;
                 let c = self.collection(body["collection_id"].as_str().unwrap_or(""))?;
                 let env = body.get("environment_id").and_then(|e| e.as_str()).map(|s| s.to_string());
-                let session = self.session(Some(&c), &env)?;
+                let mut session = self.session(Some(&c), &env)?;
+                session.scopes.vault.clear(); // mock responses must not serve vault secrets
                 let log = Arc::new(Mutex::new(Vec::<String>::new()));
                 let sink = log.clone();
                 let (handle, routes) = rspostman_core::mock::start(

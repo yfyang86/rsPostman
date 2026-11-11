@@ -1,4 +1,5 @@
 // Editors for collections / folders (auth, variables, scripts) and environments.
+import { helpButton } from "./help.js";
 import { api } from "./api.js";
 import { state, views, emit, collectionById, saveCollection, markDirty, reconcileTabs } from "./state.js";
 import { h, clear, toast, guard, kvEditor, cleanRows, tabStrip, clone } from "./util.js";
@@ -84,7 +85,7 @@ views.collection = (tab) => {
   draw();
   return h("div.page", { testid: "collection-editor" },
     h("input.name-input", { type: "text", value: draft.name, "aria-label": "Name", testid: "collection-name", onInput: (e) => { draft.name = e.target.value; dirty(); } }),
-    h("div.page-actions", h("button.btn.primary", { testid: "collection-save", onClick: () => tab.save() }, "Save"), h("span.muted", isCollection ? "Collection" : "Folder")),
+    h("div.page-actions", h("button.btn.primary", { testid: "collection-save", onClick: () => tab.save() }, "Save"), h("span.muted", isCollection ? "Collection" : "Folder"), helpButton("collections")),
     strip, h("div", { style: "padding-top:12px" }, body));
 };
 
@@ -111,7 +112,7 @@ views.environment = (tab) => {
   return h("div.page", { testid: "environment-editor" },
     isGlobals ? h("h2", "Globals") : h("input.name-input", { type: "text", value: env.name, "aria-label": "Environment name", testid: "environment-name", onInput: (e) => { env.name = e.target.value; dirty(); } }),
     h("div.page-actions", h("button.btn.primary", { testid: "environment-save", onClick: () => tab.save() }, "Save"),
-      h("span.muted", isGlobals ? "Global variables are available in every request, whatever environment is active." : "Use variables as {{name}} in URLs, headers, bodies and scripts.")),
+      h("span.muted", isGlobals ? "Global variables are available in every request, whatever environment is active." : "Use variables as {{name}} in URLs, headers, bodies and scripts."), helpButton("variables-and-environments")),
     kvEditor(env.values, { enabledKey: "enabled", onChange: dirty, keyLabel: "Variable", testid: "environment-variables", secretType: true }),
     h("p.hint", "Precedence when names clash: local → iteration data → environment → collection → globals."),
     h("p.hint", "Tick “Secret” for passwords, tokens and keys: the value is masked here and in CLI listings. Variables are stored unencrypted in the workspace folder (readable by your user account only) – for encryption at rest, put the value in the vault and set the variable to {{vault:name}}."));

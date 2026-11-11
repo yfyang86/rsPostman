@@ -24,6 +24,10 @@ use std::sync::{Arc, Mutex};
 
 static UI: Dir = include_dir!("$CARGO_MANIFEST_DIR/../../ui");
 
+/// The Help Center shows the same documents that are in the repository's `docs/` folder.
+const USER_MANUAL: &str = include_str!("../../../docs/user-manual.md");
+const SCRIPTING_REFERENCE: &str = include_str!("../../../docs/SCRIPTING.md");
+
 struct MockEntry {
     handle: ServerHandle,
     collection_id: String,
@@ -1003,6 +1007,11 @@ impl App {
         if rel.contains("..") {
             return Resp::text(400, "bad path");
         }
+        match rel {
+            "help/user-manual.md" => return Resp::new(200, "text/markdown; charset=utf-8", USER_MANUAL).with("Cache-Control", "no-cache"),
+            "help/scripting.md" => return Resp::new(200, "text/markdown; charset=utf-8", SCRIPTING_REFERENCE).with("Cache-Control", "no-cache"),
+            _ => {}
+        }
         // Development aid: serve the UI from disk when RSPOSTMAN_UI_DIR is set.
         if let Some(dir) = std::env::var_os("RSPOSTMAN_UI_DIR") {
             return match std::fs::read(std::path::Path::new(&dir).join(rel)) {
@@ -1036,4 +1045,71 @@ pub fn start(ws: Workspace, port: u16) -> Result<ServerHandle> {
     let handle = serve("127.0.0.1", port, 16, move |req| handler_app.handle(req))?;
     app.port.store(handle.port, Ordering::SeqCst);
     Ok(handle)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// GitHub-style heading anchor, the same rule the Help Center uses (`ui/js/md.js`).
+    fn slug(heading: &str) -> String {
+        let cleaned: String = heading.to_lowercase().chars().filter(|c| c.is_alphanumeric() || c.is_whitespace() || *c == '-').collect();
+        cleaned.split_whitespace().collect::<Vec<_>>().join("-")
+    }
+
+    fn targets(doc: &str, prefix: &str) -> Vec<String> {
+        let mut out = vec![];
+        let mut rest = doc;
+        while let Some(i) = rest.find("](") {
+            let after = &rest[i + 2..];
+            let end = after.find(')').unwrap_or(after.len());
+            if after[..end].starts_with(prefix) {
+                out.push(after[..end].to_string());
+            }
+            rest = &after[end..];
+        }
+        out
+    }
+
+    #[test]
+    fn manual_images_and_links_resolve() {
+        // every screenshot the manual shows is shipped with the UI …
+        let images = targets(USER_MANUAL, "../ui/help/img/");
+        assert!(images.len() >= 20, "the manual should be illustrated, found {} images", images.len());
+        for img in &images {
+            let rel = img.trim_start_matches("../ui/");
+            assert!(UI.get_file(rel).is_some(), "manual references a missing screenshot: {img}");
+        }
+        // … and every shipped screenshot is used
+        for f in UI.get_dir("help/img").expect("ui/help/img").files() {
+            let name = f.path().file_name().unwrap().to_string_lossy().to_string();
+            assert!(images.iter().any(|i| i.ends_with(&name)), "unused screenshot ui/help/img/{name}");
+        }
+        // every in-page link points at an existing heading
+        let headings: Vec<String> = USER_MANUAL.lines().filter(|l| l.starts_with('#')).map(|l| slug(l.trim_start_matches('#').trim())).collect();
+        for link in targets(USER_MANUAL, "#") {
+            assert!(headings.contains(&link[1..].to_string()), "broken link {link} in the user manual");
+        }
+        // chapters that pages link to with their "?" button
+        for anchor in ["collection-runner", "mock-servers", "websocket", "cookies", "settings", "profile-an-llm-provider", "benchmark", "vault-and-credentials", "collections", "variables-and-environments"] {
+            assert!(headings.contains(&anchor.to_string()), "no manual chapter for the help button `{anchor}`");
+        }
+        assert!(targets(USER_MANUAL, "SCRIPTING.md").len() >= 2);
+    }
+
+    #[test]
+    fn help_documents_are_served() {
+        let ws = Workspace::open(Some(std::env::temp_dir().join(format!("rsp-srv-{}", rspostman_core::model::new_id())))).unwrap();
+        let app = App::new(ws.clone());
+        let get = |path: &str| app.handle(Req { method: "GET".into(), path: path.into(), headers: vec![("Host".into(), "127.0.0.1:1".into())], ..Default::default() });
+        let manual = get("/help/user-manual.md");
+        assert_eq!(manual.status, 200);
+        assert!(String::from_utf8_lossy(&manual.body).starts_with("# rsPostman user manual"));
+        assert!(String::from_utf8_lossy(&get("/help/scripting.md").body).contains("pm.expect"));
+        let img = get("/help/img/overview.png");
+        assert_eq!((img.status, &img.body[1..4]), (200, &b"PNG"[..]));
+        assert_eq!(get("/help/img/../../Cargo.toml").status, 400);
+        assert_eq!(get("/help/nope.md").status, 404);
+        std::fs::remove_dir_all(&ws.root).ok();
+    }
 }

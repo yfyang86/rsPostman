@@ -48,7 +48,10 @@ a { color: var(--accent); }
 
 #topbar { display: flex; align-items: center; gap: 12px; padding: 0 12px; height: 44px; background: var(--panel); border-bottom: 1px solid var(--border); flex: none; }
 .brand { display: flex; align-items: center; gap: 8px; font-weight: 700; font-size: 15px; letter-spacing: -.01em; }
-#toolbar { display: flex; gap: 4px; margin-left: 8px; }
+#toolbar { display: flex; gap: 4px; margin-left: 8px; flex: 0 1 auto; min-width: 0; overflow: hidden; }
+#topbar .brand, #envbar { flex: none; }
+/* the tools keep their icons but drop their labels before the right-hand controls get squeezed */
+@media (max-width: 1340px) { #toolbar .btn span.txt { display: none; } #toolbar .btn { padding: 5px 9px; font-size: 15px; } }
 #toolbar .btn { border-color: transparent; background: transparent; color: var(--muted); }
 #toolbar .btn:hover { background: var(--bg); color: var(--text); }
 #envbar { display: flex; align-items: center; gap: 6px; }
@@ -219,4 +222,32 @@ table.data td.k { white-space: nowrap; word-break: normal; color: var(--j-key); 
 :root[data-theme="dark"] .toast.error { color: #2a0a07; } :root[data-theme="dark"] .toast.ok { color: #05210f; }
 #statusbar { height: 24px; flex: none; display: flex; align-items: center; gap: 14px; padding: 0 12px; font-size: 11px; color: var(--muted); background: var(--panel); border-top: 1px solid var(--border); white-space: nowrap; overflow: hidden; }
 #statusbar .path { overflow: hidden; text-overflow: ellipsis; }
-@media (max-width: 760px) { #sidebar { width: 210px; } #toolbar .btn span.txt { display: none; } .snippets { display: none; } .form-grid { grid-template-columns: 1fr; } }
+@media (max-width: 760px) { #sidebar { width: 210px; } .snippets { display: none; } .form-grid { grid-template-columns: 1fr; } }
+
+/* ---- Help Center */
+.help { flex: 1; display: flex; min-height: 0; }
+.help-side { width: 250px; flex: none; border-right: 1px solid var(--border); display: flex; flex-direction: column; min-height: 0; background: var(--panel-2); }
+.help-search { padding: 10px; } .help-search input { width: 100%; }
+.help-nav { overflow: auto; padding-bottom: 12px; }
+.help-group { font-size: 11px; font-weight: 700; color: var(--muted); text-transform: uppercase; letter-spacing: .05em; padding: 10px 12px 4px; }
+.help-nav button { display: block; width: 100%; text-align: left; border: 0; background: none; padding: 5px 12px; cursor: pointer; border-left: 3px solid transparent; color: var(--text); }
+.help-nav button:hover { background: var(--bg); } .help-nav button.active { border-left-color: var(--accent); background: var(--accent-soft); font-weight: 600; }
+.help-content { flex: 1; overflow: auto; padding: 20px 32px 40px; min-width: 0; outline: none; font-size: 14px; line-height: 1.6; }
+.help-content > * { max-width: 860px; }
+.help-content h2 { font-size: 22px; margin: 0 0 12px; } .help-content h3 { font-size: 16px; margin: 26px 0 8px; } .help-content h4 { font-size: 14px; margin: 18px 0 6px; }
+.help-content p { margin: 8px 0; } .help-content ul, .help-content ol { margin: 8px 0; padding-left: 24px; } .help-content li { margin: 3px 0; }
+.help-content code { font-family: var(--mono); font-size: 12.5px; background: var(--code-bg); border: 1px solid var(--border); border-radius: 4px; padding: 0 4px; }
+.help-content pre.code { background: var(--code-bg); border: 1px solid var(--border); border-radius: 8px; padding: 10px 12px; overflow: auto; white-space: pre; margin: 10px 0; }
+.help-content pre.code code { border: 0; background: none; padding: 0; }
+.help-content figure { margin: 14px 0; } .help-content figure img, .help-content p img { max-width: 100%; height: auto; border: 1px solid var(--border-strong); border-radius: 8px; display: block; box-shadow: 0 2px 10px rgba(16,24,40,.08); }
+.help-content figcaption { color: var(--muted); font-size: 12px; margin-top: 6px; }
+.help-content .table-wrap { overflow-x: auto; margin: 10px 0; } .help-content table.data td, .help-content table.data th { padding: 6px 10px; font-family: inherit; font-size: 13px; word-break: normal; position: static; }
+.help-content table.data td code { white-space: nowrap; }
+.help-content .note { border-left: 3px solid var(--accent); background: var(--accent-soft); padding: 6px 12px; border-radius: 0 6px 6px 0; margin: 12px 0; } .help-content .note p { margin: 4px 0; }
+.help-content hr { border: 0; border-top: 1px solid var(--border); margin: 20px 0; }
+.help-pager { display: flex; justify-content: space-between; gap: 12px; margin-top: 32px; padding-top: 14px; border-top: 1px solid var(--border); }
+.help-hit { display: block; width: 100%; text-align: left; border: 1px solid var(--border); background: var(--panel); border-radius: 8px; padding: 9px 12px; margin-bottom: 8px; cursor: pointer; color: var(--text); }
+.help-hit:hover, .help-hit:focus-visible { border-color: var(--accent); } .help-hit b { display: block; margin-bottom: 2px; } .help-hit span { color: var(--muted); font-size: 13px; }
+.help-btn { border: 1px solid var(--border-strong); border-radius: 50%; width: 20px; height: 20px; font-size: 12px; font-weight: 700; vertical-align: middle; margin-left: 8px; }
+.page h2 .help-btn { position: relative; top: -2px; }
+@media (max-width: 760px) { .help-side { width: 170px; } .help-content { padding: 14px 16px 30px; } }

@@ -8,6 +8,7 @@ import "./editors.js";
 import "./tools.js";
 import "./perf.js";
 import { openVault } from "./vault.js";
+import { openHelp } from "./help.js";
 
 const $ = (id) => document.getElementById(id);
 
@@ -49,6 +50,7 @@ function renderEnvbar() {
       if (state.activeEnv) openEnvironment(state.activeEnv);
       else { state.side = "environments"; renderSidebar(); }
     } }, h("span", { html: '<svg width="15" height="15" viewBox="0 0 16 16" aria-hidden="true"><path d="M11.5 2.2l2.3 2.3-8 8-3 .7.7-3z" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linejoin="round"/></svg>' })),
+    h("button.icon-btn", { title: "Help (F1)", "aria-label": "Help", testid: "help-open", style: "font-weight:700", onClick: () => openHelp() }, "?"),
     h("button.icon-btn", { title: "Toggle light / dark theme", "aria-label": "Toggle theme", testid: "theme-toggle", onClick: () => applyTheme(document.documentElement.dataset.theme === "dark" ? "light" : "dark") }, h("span", { html: '<svg width="16" height="16" viewBox="0 0 16 16" aria-hidden="true"><circle cx="8" cy="8" r="6.2" fill="none" stroke="currentColor" stroke-width="1.5"/><path d="M8 1.8a6.2 6.2 0 0 1 0 12.4z" fill="currentColor"/></svg>' })));
 }
 
@@ -371,7 +373,7 @@ function tabIcon(t) {
     const m = t.request.method;
     return h("span.method." + methodClass(m), { style: "width:auto" }, m === "DELETE" ? "DEL" : m.slice(0, 5));
   }
-  return h("span.muted", { style: "font-size:11px" }, { vault: "▮", collection: "▣", environment: "◈", runner: "▶", ws: "⇄", mock: "◎", cookies: "◍", settings: "⚙" }[t.kind] || "•");
+  return h("span.muted", { style: "font-size:11px" }, { help: "?", vault: "▮", collection: "▣", environment: "◈", runner: "▶", ws: "⇄", mock: "◎", cookies: "◍", settings: "⚙" }[t.kind] || "•");
 }
 
 function renderTabbar() {
@@ -395,7 +397,7 @@ function renderWorkspace() {
         h("button.btn.primary", { testid: "welcome-new", onClick: () => openNewRequest() }, "New request"),
         h("button.btn", { onClick: createCollection }, "New collection"),
         tools.filter((t) => t.id === "import").map((t) => h("button.btn", { onClick: t.action }, "Import…"))),
-      h("p", { style: "margin-top:18px;font-size:12px" }, h("kbd", "Ctrl"), " + ", h("kbd", "Enter"), " send · ", h("kbd", "Ctrl"), " + ", h("kbd", "S"), " save · ", h("kbd", "Ctrl"), " + ", h("kbd", "N"), " new request")));
+      h("p", { style: "margin-top:18px;font-size:12px" }, h("kbd", "Ctrl"), " + ", h("kbd", "Enter"), " send · ", h("kbd", "Ctrl"), " + ", h("kbd", "S"), " save · ", h("kbd", "Ctrl"), " + ", h("kbd", "N"), " new request · ", h("kbd", "F1"), " ", h("a", { href: "#", testid: "welcome-help", onClick: (e) => { e.preventDefault(); openHelp(); } }, "help"))));
     return;
   }
   if (!tab.el) {
@@ -432,6 +434,7 @@ on("tabmeta", renderTabbar);
 // ---------------------------------------------------------------- global keys, resizer
 
 document.addEventListener("keydown", (e) => {
+  if (e.key === "F1") { e.preventDefault(); openHelp(); return; }
   const mod = e.ctrlKey || e.metaKey;
   if (!mod) return;
   const tab = activeTab();

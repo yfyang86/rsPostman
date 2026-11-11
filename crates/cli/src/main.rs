@@ -236,6 +236,87 @@ enum Cmd {
         #[arg(short, long)]
         verbose: bool,
     },
+    /// Benchmark a request or every request of a collection: latency percentiles P10/P50/P90/P95/P99,
+    /// requests per second, throughput and error counts
+    #[command(alias = "bench")]
+    Benchmark {
+        /// Ad-hoc request: `[METHOD] URL`
+        #[arg(num_args = 0..=2, value_name = "[METHOD] URL")]
+        target: Vec<String>,
+        /// Collection id, name or exported file (omit for an ad-hoc request)
+        #[arg(long)]
+        collection: Option<String>,
+        /// Request id, name or `Folder/Name` path (requires a collection)
+        #[arg(short, long, requires = "collection")]
+        request: Option<String>,
+        /// Benchmark only this folder, id, name or path (requires a collection)
+        #[arg(long, conflicts_with = "request")]
+        folder: Option<String>,
+        #[command(flatten)]
+        req: RequestArgs,
+        /// Environment (name, id or exported file); default: the active environment
+        #[arg(short, long)]
+        env: Option<String>,
+        /// Iterations of each request (default: 10)
+        #[arg(short = 'n', long, default_value_t = 10)]
+        iterations: usize,
+        /// Number of concurrent workers
+        #[arg(short = 'c', long, default_value_t = 1)]
+        concurrency: usize,
+        /// Delay between requests in milliseconds
+        #[arg(long, default_value_t = 0, value_name = "MS")]
+        delay: u64,
+        /// Skip TLS certificate verification
+        #[arg(short = 'k', long)]
+        insecure: bool,
+        /// Request timeout in milliseconds
+        #[arg(long, value_name = "MS")]
+        timeout: Option<u64>,
+        /// Write a JSON report
+        #[arg(long, value_name = "FILE")]
+        report_json: Option<PathBuf>,
+        /// Only print the summary
+        #[arg(long)]
+        quiet: bool,
+    },
+    /// Profile an LLM provider: streaming health, time to first token, output rate and token usage
+    Profile {
+        /// `[METHOD] URL` of the completions endpoint (OpenAI-compatible)
+        #[arg(required = true, num_args = 1..=2, value_name = "[METHOD] URL")]
+        target: Vec<String>,
+        #[command(flatten)]
+        req: RequestArgs,
+        /// Model for the generated chat body
+        #[arg(long, default_value = "gpt-4o-mini", value_name = "NAME")]
+        model: String,
+        /// User prompt for the generated chat body
+        #[arg(long, default_value = "Say hello in a few words.", value_name = "TEXT")]
+        prompt: String,
+        /// Max tokens for the generated chat body
+        #[arg(long, value_name = "N")]
+        max_tokens: Option<u32>,
+        /// Number of profiling runs (default: 3)
+        #[arg(short = 'n', long, default_value_t = 3)]
+        iterations: usize,
+        /// Delay between runs in milliseconds
+        #[arg(long, default_value_t = 0, value_name = "MS")]
+        delay: u64,
+        /// Environment (name, id or exported file); default: the active environment
+        #[arg(short, long)]
+        env: Option<String>,
+        /// Show the captured completions
+        #[arg(short, long)]
+        verbose: bool,
+        /// Skip TLS certificate verification
+        #[arg(short = 'k', long)]
+        insecure: bool,
+        /// Request timeout in milliseconds
+        #[arg(long, value_name = "MS")]
+        timeout: Option<u64>,
+        /// Write a JSON report
+        #[arg(long, value_name = "FILE")]
+        report_json: Option<PathBuf>,
+    },
     /// Serve the saved examples of a collection as a local mock server
     Mock {
         collection: String,
@@ -687,6 +768,115 @@ fn parse_interval(s: &str) -> Result<u64> {
         "ms" => (n / 1000).max(1),
         _ => bail!("invalid interval unit in `{s}` (use s, m or h)"),
     })
+}
+
+/// One millisecond value for tables: keep one decimal for small numbers.
+fn fmt_ms(x: f64) -> String {
+    if x < 10.0 {
+        format!("{x:.1}")
+    } else {
+        format!("{x:.0}")
+    }
+}
+
+fn print_bench_summary(r: &rspostman_core::profile::BenchReport) {
+    use rspostman_core::http::{human_size, human_time};
+    println!();
+    match &r.overall {
+        Some(s) => out::table(
+            &["LATENCY (ms)", "MIN", "P10", "P50", "P90", "P95", "P99", "MAX", "MEAN"],
+            &[vec!["all requests".into(), fmt_ms(s.min), fmt_ms(s.p10), fmt_ms(s.p50), fmt_ms(s.p90), fmt_ms(s.p95), fmt_ms(s.p99), fmt_ms(s.max), fmt_ms(s.mean)]],
+        ),
+        None => println!("{}", out::red("no successful requests")),
+    }
+    if r.by_name.len() > 1 {
+        let rows: Vec<Vec<String>> = r
+            .by_name
+            .iter()
+            .map(|n| {
+                let s = n.stats.as_ref();
+                vec![
+                    n.name.clone(),
+                    n.requests.to_string(),
+                    n.errors.to_string(),
+                    s.map(|s| fmt_ms(s.p50)).unwrap_or_else(|| "-".into()),
+                    s.map(|s| fmt_ms(s.p90)).unwrap_or_else(|| "-".into()),
+                    s.map(|s| fmt_ms(s.p99)).unwrap_or_else(|| "-".into()),
+                    s.map(|s| fmt_ms(s.mean)).unwrap_or_else(|| "-".into()),
+                ]
+            })
+            .collect();
+        println!();
+        out::table(&["REQUEST", "OK", "ERRORS", "P50", "P90", "P99", "MEAN"], &rows);
+    }
+    println!(
+        "\n{} requests in {} · {:.2} req/s · {} received · {} error(s)",
+        r.total_requests,
+        human_time(r.duration_ms),
+        r.rps(),
+        human_size(r.bytes),
+        r.errors
+    );
+    if let Some(a) = &r.aborted {
+        println!("{}", out::yellow(a));
+    }
+}
+
+fn print_profile_report(r: &rspostman_core::profile::ProfileReport, verbose: bool) {
+    use rspostman_core::http::human_time;
+    let has_usage = r.samples.iter().any(|s| s.usage.is_some());
+    for (i, s) in r.samples.iter().enumerate() {
+        let tag = out::dim(&format!("run {}", i + 1));
+        match &s.error {
+            Some(e) => println!("  {tag}  {} {e}", out::red("ERROR")),
+            None => {
+                let units = if has_usage {
+                    format!("{} completion tokens", s.usage.as_ref().map(|u| u.completion_tokens).unwrap_or(0))
+                } else {
+                    format!("{} events", s.events)
+                };
+                let unit = if has_usage { "tok/s" } else { "evt/s" };
+                println!(
+                    "  {tag}  {}  ttft {}  total {}  {}  {:.1} {}  {}",
+                    out::status(s.status, &s.status_text),
+                    human_time(s.ttfb_ms),
+                    human_time(s.total_ms),
+                    units,
+                    s.rate_per_s,
+                    unit,
+                    out::dim(s.model.as_deref().unwrap_or(""))
+                );
+            }
+        }
+    }
+    let verdict = match r.verdict.as_str() {
+        "healthy" => out::green("healthy"),
+        "degraded" => out::yellow("degraded"),
+        other => out::red(other),
+    };
+    let ok = r.samples.iter().filter(|s| s.error.is_none()).count();
+    println!("\n{} {verdict} ({}/{})", out::bold("Verdict:"), ok, r.samples.len());
+    for n in &r.notes {
+        println!("  {} {n}", out::dim("note:"));
+    }
+    let rows: Vec<Vec<String>> = [("TTFT (ms)", &r.ttfb), ("Total (ms)", &r.total), (if has_usage { "Rate (tok/s)" } else { "Rate (evt/s)" }, &r.rate)]
+        .iter()
+        .filter_map(|(label, s)| {
+            s.as_ref().map(|s| {
+                vec![label.to_string(), fmt_ms(s.min), fmt_ms(s.p50), fmt_ms(s.p90), fmt_ms(s.p99), fmt_ms(s.max), fmt_ms(s.mean)]
+            })
+        })
+        .collect();
+    if !rows.is_empty() {
+        out::table(&["", "MIN", "P50", "P90", "P99", "MAX", "MEAN"], &rows);
+    }
+    if verbose {
+        for (i, s) in r.samples.iter().enumerate() {
+            if !s.completion.is_empty() {
+                println!("\n{} {}", out::dim(&format!("run {} output:", i + 1)), s.completion);
+            }
+        }
+    }
 }
 
 fn resolve_item<'a>(c: &'a Collection, reference: &str) -> Result<&'a Item> {
@@ -1257,6 +1447,118 @@ fn run(cli: Cli) -> Result<i32> {
                 }
             }
             Ok(if summary.success() { 0 } else { 1 })
+        }
+        Cmd::Benchmark { collection, request, folder, target, req, env, iterations, concurrency, delay, insecure, timeout, report_json, quiet } => {
+            use rspostman_core::profile;
+            let mut session = Session::load(&ws, None, env.as_deref())?;
+            let mut tasks: Vec<profile::BenchTask> = vec![];
+            match &collection {
+                Some(cr) => {
+                    let c = ws.find_collection(cr)?;
+                    session = Session::load(&ws, Some(&c), env.as_deref())?;
+                    let all = c.requests();
+                    let list: Vec<(String, &Item)> = match (&request, &folder) {
+                        (Some(r), _) => {
+                            let it = resolve_item(&c, r)?;
+                            let path = all.iter().find(|(_, i)| i.id == it.id).map(|(p, _)| p.clone()).unwrap_or_else(|| it.name.clone());
+                            vec![(path, it)]
+                        }
+                        (None, Some(f)) => {
+                            let it = resolve_item(&c, f)?;
+                            c.requests_in(&it.id)
+                        }
+                        (None, None) => all,
+                    };
+                    if list.is_empty() {
+                        bail!("no requests to benchmark in collection `{}`", c.info.name);
+                    }
+                    for (path, item) in &list {
+                        let Some(r) = &item.request else { continue };
+                        let auth = c.effective_auth(&item.id);
+                        let prepared = rspostman_core::http::prepare(r, auth.as_ref(), &session.scopes)?;
+                        tasks.push(profile::BenchTask { name: path.clone(), prepared });
+                    }
+                }
+                None => {
+                    if target.is_empty() {
+                        bail!("give either a collection (with --request or --folder) or an ad-hoc `[METHOD] URL`");
+                    }
+                    let r = build_request(&target, &req)?;
+                    let prepared = rspostman_core::http::prepare(&r, r.auth.as_ref(), &session.scopes)?;
+                    tasks.push(profile::BenchTask { name: format!("{} {}", prepared.method, prepared.url), prepared });
+                }
+            }
+            if insecure {
+                session.settings.verify_ssl = false;
+            }
+            if let Some(t) = timeout {
+                session.settings.timeout_ms = t;
+            }
+            if !quiet {
+                let names: Vec<&str> = tasks.iter().map(|t| t.name.as_str()).collect();
+                eprintln!("{} {}", out::bold("Benchmark"), out::dim(&format!("{} · {} iteration(s) · {} worker(s)", names.join(", "), iterations, concurrency.max(1))));
+            }
+            let count = std::sync::atomic::AtomicUsize::new(0);
+            let on_sample = |s: &profile::BenchSample| {
+                let n = count.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+                if quiet {
+                    return;
+                }
+                match &s.error {
+                    Some(e) => eprintln!("  {} {}  {}", out::red("✗"), out::bold(&s.name), out::red(e)),
+                    None => eprintln!("  {} {}  {} {}", out::dim(&format!("#{n}")), out::bold(&s.name), out::status(s.status, ""), out::dim(&rspostman_core::http::human_time(s.time_ms))),
+                }
+            };
+            let report = profile::benchmark(&tasks, &session.settings, iterations, delay, concurrency, None, &on_sample);
+            print_bench_summary(&report);
+            if let Some(p) = &report_json {
+                std::fs::write(p, serde_json::to_string_pretty(&report)?).with_context(|| format!("cannot write {}", p.display()))?;
+                eprintln!("report written to {}", p.display());
+            }
+            Ok(if report.errors > 0 { 1 } else { 0 })
+        }
+        Cmd::Profile { target, req, model, prompt, max_tokens, iterations, delay, env, verbose, insecure, timeout, report_json } => {
+            use rspostman_core::profile;
+            let mut request = build_request(&target, &req)?;
+            // the generated chat body implies POST when the method was not given explicitly
+            if target.len() == 1 {
+                request.method = "POST".into();
+            }
+            if req.json.is_none() {
+                let mut body = serde_json::json!({
+                    "model": model,
+                    "messages": [{"role": "user", "content": prompt}],
+                    "stream": true,
+                });
+                if let Some(n) = max_tokens {
+                    body["max_tokens"] = serde_json::json!(n);
+                }
+                request.body = Some(Body::raw(&body.to_string(), "json"));
+            } else if let Some(raw) = request.body.as_ref().and_then(|b| b.raw.clone()) {
+                // keep an explicit --json body, making sure streaming is requested
+                if let Ok(mut v) = serde_json::from_str::<serde_json::Value>(&raw) {
+                    if let Some(o) = v.as_object_mut() {
+                        o.entry("stream".to_string()).or_insert(serde_json::Value::Bool(true));
+                        request.body = Some(Body::raw(&v.to_string(), "json"));
+                    }
+                }
+            }
+            let mut session = Session::load(&ws, None, env.as_deref())?;
+            if insecure {
+                session.settings.verify_ssl = false;
+            }
+            if let Some(t) = timeout {
+                session.settings.timeout_ms = t;
+            }
+            let prepared = rspostman_core::http::prepare(&request, request.auth.as_ref(), &session.scopes)?;
+            eprintln!("{} {}", out::method(&prepared.method), prepared.url);
+            let report = profile::profile_llm(&prepared, &session.settings, iterations, delay, None);
+            print_profile_report(&report, verbose);
+            if let Some(p) = &report_json {
+                std::fs::write(p, serde_json::to_string_pretty(&report)?).with_context(|| format!("cannot write {}", p.display()))?;
+                eprintln!("report written to {}", p.display());
+            }
+            Ok(if report.healthy() { 0 } else { 1 })
         }
         Cmd::Mock { collection, port, host, env, delay, no_cors } => {
             let c = ws.find_collection(&collection)?;

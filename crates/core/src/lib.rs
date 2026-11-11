@@ -14,6 +14,7 @@ pub mod import;
 pub mod import_ext;
 pub mod mock;
 pub mod model;
+pub mod profile;
 pub mod report;
 pub mod runner;
 pub mod script;

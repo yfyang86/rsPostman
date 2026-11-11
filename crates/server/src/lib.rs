@@ -11,6 +11,7 @@ use rspostman_core::engine::{self, Exchange, Session};
 use rspostman_core::import::Imported;
 use rspostman_core::mock::{MockOptions, MockRoute};
 use rspostman_core::model::{Auth, Collection, Environment, Request};
+use rspostman_core::profile::{self, BenchReport, ProfileReport};
 use rspostman_core::runner::{self, RunEvent, RunOptions, RunSummary};
 use rspostman_core::server::{serve, Req, Resp, ServerHandle};
 use rspostman_core::ws::WsClient;
@@ -42,12 +43,34 @@ struct RunEntry {
     cancel: Arc<AtomicBool>,
 }
 
+#[derive(Default)]
+struct ProfileEntry {
+    done: bool,
+    runs_total: usize,
+    runs_done: usize,
+    report: Option<ProfileReport>,
+    error: Option<String>,
+    cancel: Arc<AtomicBool>,
+}
+
+#[derive(Default)]
+struct BenchEntry {
+    done: bool,
+    total: usize,
+    done_count: usize,
+    report: Option<BenchReport>,
+    error: Option<String>,
+    cancel: Arc<AtomicBool>,
+}
+
 pub struct App {
     ws: Workspace,
     port: std::sync::atomic::AtomicU16,
     sockets: Mutex<HashMap<String, WsClient>>,
     mocks: Mutex<HashMap<String, MockEntry>>,
     runs: Mutex<HashMap<String, Arc<Mutex<RunEntry>>>>,
+    profiles: Mutex<HashMap<String, Arc<Mutex<ProfileEntry>>>>,
+    benchmarks: Mutex<HashMap<String, Arc<Mutex<BenchEntry>>>>,
 }
 
 fn mime(path: &str) -> &'static str {
@@ -131,7 +154,7 @@ fn yes() -> bool {
 
 impl App {
     pub fn new(ws: Workspace) -> Arc<App> {
-        Arc::new(App { ws, port: Default::default(), sockets: Default::default(), mocks: Default::default(), runs: Default::default() })
+        Arc::new(App { ws, port: Default::default(), sockets: Default::default(), mocks: Default::default(), runs: Default::default(), profiles: Default::default(), benchmarks: Default::default() })
     }
 
     fn collection(&self, id: &str) -> Result<Collection> {
@@ -289,6 +312,131 @@ impl App {
                 "stats": s.stats, "duration_ms": s.duration_ms, "aborted": s.aborted, "success": s.success(),
                 "collection_name": s.collection_name, "environment": s.environment, "started": s.started,
             })),
+        }))
+    }
+
+    fn start_profile(self: &Arc<Self>, body: Value) -> Result<Value> {
+        let mut request: Request = serde_json::from_value(body["request"].clone()).context("400:invalid request")?;
+        // Generated OpenAI-compatible chat body unless the request already carries one.
+        let has_body = request.body.as_ref().map(|b| b.mode == "raw" && b.raw.as_deref().map(|r| !r.trim().is_empty()).unwrap_or(false)).unwrap_or(false);
+        if !has_body {
+            let mut chat = json!({
+                "model": body["model"].as_str().filter(|s| !s.is_empty()).unwrap_or("gpt-4o-mini"),
+                "messages": [{"role": "user", "content": body["prompt"].as_str().unwrap_or("Say hello in a few words.")}],
+                "stream": true,
+            });
+            if let Some(n) = body["max_tokens"].as_u64().filter(|n| *n > 0) {
+                chat["max_tokens"] = json!(n);
+            }
+            request.method = "POST".into();
+            request.body = Some(rspostman_core::model::Body::raw(&chat.to_string(), "json"));
+        }
+        let iterations = body["iterations"].as_u64().filter(|n| *n > 0).unwrap_or(3) as usize;
+        let delay_ms = body["delay_ms"].as_u64().unwrap_or(0);
+        let collection = match body["collection_id"].as_str() {
+            Some(id) if !id.is_empty() => self.ws.collection(id)?,
+            _ => None,
+        };
+        let env = body.get("environment_id").and_then(|e| e.as_str()).map(|s| s.to_string());
+        let session = self.session(collection.as_ref(), &env)?;
+        let auth = request.auth.clone().or_else(|| collection.and_then(|c| c.auth.clone()));
+        let prepared = rspostman_core::http::prepare(&request, auth.as_ref(), &session.scopes).map_err(|e| anyhow!("400:{e}"))?;
+        let settings = session.settings;
+        let id = rspostman_core::model::new_id();
+        let entry = Arc::new(Mutex::new(ProfileEntry { runs_total: iterations, ..Default::default() }));
+        let cancel = entry.lock().map(|e| e.cancel.clone()).map_err(|_| anyhow!("lock poisoned"))?;
+        self.profiles.lock().map_err(|_| anyhow!("lock poisoned"))?.insert(id.clone(), entry.clone());
+        std::thread::spawn(move || {
+            let report = profile::profile_llm(&prepared, &settings, iterations, delay_ms, Some(&cancel));
+            let runs_done = report.samples.len();
+            if let Ok(mut e) = entry.lock() {
+                e.runs_done = runs_done;
+                e.report = Some(report);
+                e.done = true;
+            }
+        });
+        Ok(json!({ "id": id }))
+    }
+
+    fn profile_status(&self, id: &str) -> Result<Value> {
+        let entry = self.profiles.lock().map_err(|_| anyhow!("lock poisoned"))?.get(id).cloned().ok_or_else(|| not_found("profile"))?;
+        let e = entry.lock().map_err(|_| anyhow!("lock poisoned"))?;
+        Ok(json!({
+            "id": id,
+            "done": e.done,
+            "runs_total": e.runs_total,
+            "runs_done": e.runs_done,
+            "report": e.report,
+            "error": e.error,
+        }))
+    }
+
+    fn start_benchmark(self: &Arc<Self>, body: Value) -> Result<Value> {
+        let iterations = body["iterations"].as_u64().filter(|n| *n > 0).unwrap_or(10) as usize;
+        let concurrency = body["concurrency"].as_u64().filter(|n| *n > 0).unwrap_or(1) as usize;
+        let delay_ms = body["delay_ms"].as_u64().unwrap_or(0);
+        let env = body.get("environment_id").and_then(|e| e.as_str()).map(|s| s.to_string());
+        let mut tasks: Vec<profile::BenchTask> = vec![];
+        let adhoc: Option<Request> = serde_json::from_value(body["request"].clone()).ok();
+        match (body["collection_id"].as_str().filter(|s| !s.is_empty()), adhoc) {
+            (Some(cid), _) => {
+                let c = self.collection(cid)?;
+                let session = self.session(Some(&c), &env)?;
+                let all = c.requests();
+                let list: Vec<(String, &rspostman_core::model::Item)> = match (body["request_id"].as_str().filter(|s| !s.is_empty()), body["folder_id"].as_str().filter(|s| !s.is_empty())) {
+                    (Some(rid), _) => {
+                        let it = c.find(rid).ok_or_else(|| anyhow!("404:request `{rid}` not found"))?;
+                        let path = all.iter().find(|(_, i)| i.id == it.id).map(|(p, _)| p.clone()).unwrap_or_else(|| it.name.clone());
+                        vec![(path, it)]
+                    }
+                    (None, Some(fid)) => c.requests_in(fid),
+                    (None, None) => all,
+                };
+                if list.is_empty() {
+                    bail!("400:collection has no requests to benchmark");
+                }
+                for (path, item) in &list {
+                    let Some(r) = &item.request else { continue };
+                    let auth = c.effective_auth(&item.id);
+                    let prepared = rspostman_core::http::prepare(r, auth.as_ref(), &session.scopes).map_err(|e| anyhow!("400:{e}"))?;
+                    tasks.push(profile::BenchTask { name: path.clone(), prepared });
+                }
+            }
+            (None, Some(request)) => {
+                let session = self.session(None, &env)?;
+                let prepared = rspostman_core::http::prepare(&request, request.auth.as_ref(), &session.scopes).map_err(|e| anyhow!("400:{e}"))?;
+                tasks.push(profile::BenchTask { name: format!("{} {}", prepared.method, prepared.url), prepared });
+            }
+            (None, None) => bail!("400:give a collection_id or a request"),
+        }
+        let settings = self.session(None, &env)?.settings;
+        let total = tasks.len() * iterations;
+        let id = rspostman_core::model::new_id();
+        let entry = Arc::new(Mutex::new(BenchEntry { total, ..Default::default() }));
+        let cancel = entry.lock().map(|e| e.cancel.clone()).map_err(|_| anyhow!("lock poisoned"))?;
+        self.benchmarks.lock().map_err(|_| anyhow!("lock poisoned"))?.insert(id.clone(), entry.clone());
+        std::thread::spawn(move || {
+            let on_sample = |_: &profile::BenchSample| {};
+            let report = profile::benchmark(&tasks, &settings, iterations, delay_ms, concurrency, Some(&cancel), &on_sample);
+            if let Ok(mut e) = entry.lock() {
+                e.done_count = report.samples.len();
+                e.report = Some(report);
+                e.done = true;
+            }
+        });
+        Ok(json!({ "id": id, "total": total }))
+    }
+
+    fn benchmark_status(&self, id: &str) -> Result<Value> {
+        let entry = self.benchmarks.lock().map_err(|_| anyhow!("lock poisoned"))?.get(id).cloned().ok_or_else(|| not_found("benchmark"))?;
+        let e = entry.lock().map_err(|_| anyhow!("lock poisoned"))?;
+        Ok(json!({
+            "id": id,
+            "done": e.done,
+            "total": e.total,
+            "done_count": e.done_count,
+            "report": e.report,
+            "error": e.error,
         }))
     }
 
@@ -566,6 +714,22 @@ impl App {
                     Some("json") => Resp::new(200, "application/json", rspostman_core::report::json(s)).with("Content-Disposition", "attachment; filename=\"run-report.json\""),
                     _ => Resp::new(200, "text/html; charset=utf-8", rspostman_core::report::html(s)),
                 })
+            }
+
+            // ---------------------------------------------------------- profile & benchmark
+            ("POST", ["profile"]) => ok(self.start_profile(req.json()?).map_err(|e| anyhow!("400:{e:#}"))?),
+            ("GET", ["profile", id]) => ok(self.profile_status(id)?),
+            ("POST", ["profile", id, "cancel"]) => {
+                let entry = self.profiles.lock().map_err(|_| lock_err())?.get(*id).cloned().ok_or_else(|| not_found("profile"))?;
+                entry.lock().map_err(|_| lock_err())?.cancel.store(true, Ordering::SeqCst);
+                ok(json!({"cancelled": true}))
+            }
+            ("POST", ["benchmark"]) => ok(self.start_benchmark(req.json()?).map_err(|e| anyhow!("400:{e:#}"))?),
+            ("GET", ["benchmark", id]) => ok(self.benchmark_status(id)?),
+            ("POST", ["benchmark", id, "cancel"]) => {
+                let entry = self.benchmarks.lock().map_err(|_| lock_err())?.get(*id).cloned().ok_or_else(|| not_found("benchmark"))?;
+                entry.lock().map_err(|_| lock_err())?.cancel.store(true, Ordering::SeqCst);
+                ok(json!({"cancelled": true}))
             }
 
             // ---------------------------------------------------------- mock servers

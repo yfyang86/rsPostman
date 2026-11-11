@@ -6,6 +6,7 @@ import { findItem, duplicateItem, walk, newRequest, normalizeRequest } from "./m
 import "./request.js";
 import "./editors.js";
 import "./tools.js";
+import "./perf.js";
 
 const $ = (id) => document.getElementById(id);
 

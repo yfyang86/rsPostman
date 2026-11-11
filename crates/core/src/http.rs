@@ -399,7 +399,7 @@ pub fn prepare(req: &Request, auth: Option<&Auth>, sc: &Scopes) -> Result<Prepar
     Ok(p)
 }
 
-fn build_client(st: &Settings) -> Result<reqwest::blocking::Client> {
+pub(crate) fn build_client(st: &Settings) -> Result<reqwest::blocking::Client> {
     let mut b = reqwest::blocking::Client::builder()
         .redirect(reqwest::redirect::Policy::none())
         .danger_accept_invalid_certs(!st.verify_ssl)
@@ -423,7 +423,7 @@ fn build_client(st: &Settings) -> Result<reqwest::blocking::Client> {
     Ok(b.build()?)
 }
 
-fn explain(e: reqwest::Error) -> anyhow::Error {
+pub(crate) fn explain(e: reqwest::Error) -> anyhow::Error {
     let mut msg = e.to_string();
     let mut src = std::error::Error::source(&e);
     while let Some(s) = src {

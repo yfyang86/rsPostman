@@ -74,6 +74,12 @@ rspostman monitor Shop --every 5m
 rspostman ws wss://echo.example/socket -m hello
 rspostman codegen python -c Shop -r "List orders"
 rspostman docs Shop -f html -o shop.html
+
+# performance: benchmark an endpoint or collection, profile an LLM provider
+rspostman benchmark https://api.example.com/users -n 100 -c 10        # P10/P50/P90/P95/P99 + req/s
+rspostman benchmark --collection Shop -n 20 --folder "List orders"    # per-request percentiles
+rspostman profile https://api.openai.com/v1/chat/completions \
+    --model gpt-4o-mini --prompt "Say hello" -H "Authorization: Bearer $KEY" -n 5
 ```
 
 `rspostman <command> --help` documents every option. `rspostman echo` starts a small
@@ -97,6 +103,7 @@ reports two failed assertions and exits with status 1 – add `--folder Auth` fo
 | Scripts | Pre-request and test scripts at collection, folder and request level in an embedded JavaScript engine: `pm.test`, `pm.expect` (chai-style), `pm.response`, `pm.request`, all variable scopes, `pm.sendRequest`, `pm.execution.setNextRequest` / `skipRequest`, `pm.cookies`, `pm.info`, `pm.visualizer.set`, legacy `postman.*` / `tests[...]`, `console.*`. See [docs/SCRIPTING.md](docs/SCRIPTING.md) |
 | Collections | Folders, drag-and-drop reordering, duplicate, descriptions, saved examples, collection/folder auth + scripts + variables |
 | Runner | Folder selection, iterations, CSV/JSON data files, delay, bail, flow control, live progress; reports: console, JSON, JUnit XML, HTML |
+| Performance | `benchmark`: latency percentiles P10/P50/P90/P95/P99, req/s, throughput, per-request stats for collections, concurrency; `profile`: LLM streaming health (healthy / degraded / unhealthy), time-to-first-token, output rate (tokens/s or events/s), token usage, captured completions |
 | Mock servers | Serve saved examples; path variables, example selection by header, dynamic variables in bodies, CORS, request log |
 | Monitors | `rspostman monitor` runs a collection on an interval and appends results to a JSON-lines log |
 | Import / export | Postman Collection v2.0/v2.1, Postman environments/globals, OpenAPI 3, Swagger 2 (JSON/YAML), HAR, curl; export Postman v2.1 |

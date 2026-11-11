@@ -242,7 +242,11 @@ impl Session {
 }
 
 /// Record an exchange in the workspace history.
+///
+/// Unless `settings.history_store_secrets` is on, literal credentials are replaced by
+/// `<redacted>` in the stored request, the wire snapshot and the response.
 pub fn record(ws: &Workspace, settings: &Settings, ex: &Exchange, source: Option<&Request>, collection_id: Option<&str>) -> Result<()> {
+    let keep = settings.history_store_secrets;
     ws.append_history(
         HistoryEntry {
             id: ex.id.clone(),
@@ -250,9 +254,9 @@ pub fn record(ws: &Workspace, settings: &Settings, ex: &Exchange, source: Option
             name: if ex.name.is_empty() { None } else { Some(ex.name.clone()) },
             collection_id: collection_id.map(|s| s.to_string()),
             item_id: ex.item_id.clone(),
-            source: source.cloned(),
-            request: ex.request.clone(),
-            response: ex.response.clone(),
+            source: source.map(|r| if keep { r.clone() } else { crate::secrets::redact_request(r) }),
+            request: ex.request.as_ref().map(|p| if keep { p.clone() } else { crate::secrets::redact_prepared(p) }),
+            response: ex.response.as_ref().map(|r| if keep { r.clone() } else { crate::secrets::redact_response(r) }),
             error: ex.error.clone(),
         },
         settings,

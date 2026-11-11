@@ -146,6 +146,11 @@ table.kv th.t, table.kv td.t { width: 74px; }
 table.kv input[type=text] { width: 100%; border: 1px solid transparent; border-radius: 0; background: transparent; padding: 6px; font-family: var(--mono); font-size: 12.5px; box-shadow: none; }
 table.kv input[type=text]:focus { border-color: var(--accent); background: var(--panel); }
 table.kv select { border: 0; background: transparent; width: 100%; font-size: 12px; padding: 4px 2px; box-shadow: none; }
+table.kv th.s, table.kv td.s { width: 58px; text-align: center; }
+table.kv input[type=password] { width: 100%; border: 1px solid transparent; border-radius: 0; background: transparent; padding: 6px; font-family: var(--mono); font-size: 12.5px; box-shadow: none; }
+table.kv input[type=password]:focus { border-color: var(--accent); background: var(--panel); }
+.secret { display: flex; align-items: center; min-width: 0; } .secret input { flex: 1; min-width: 0; } .secret .reveal { margin-left: 2px; }
+.form-grid .secret input { width: 100%; }
 table.kv tr.off input[type=text] { color: var(--faint); text-decoration: line-through; }
 table.kv .file-cell { display: flex; align-items: center; } table.kv .file-cell input { flex: 1; }
 table.data { width: 100%; border-collapse: collapse; }

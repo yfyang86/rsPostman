@@ -50,7 +50,7 @@ The workspace folder is `~/.rspostman` by default; override it with `--workspace
 ```bash
 # ad-hoc requests
 rspostman send https://httpbin.org/get -q page=2 -H 'Accept: application/json'
-rspostman send POST https://httpbin.org/post --json '{"name": "Ann"}' -u user:pass
+rspostman send POST https://httpbin.org/post --json '{"name": "Ann"}' -u user   # asks for the password
 rspostman send https://example.com/upload -F note=hi -F file=@./photo.png
 
 # collections and environments
@@ -58,6 +58,7 @@ rspostman collection create Shop
 rspostman c set-var Shop base https://api.example.com
 rspostman c add-request Shop "List orders" '{{base}}/orders?state={{state}}'
 rspostman env create dev && rspostman env set dev state open && rspostman env use dev
+rspostman env set dev api_token --secret        # asks for the value, masks it in listings
 rspostman request Shop "List orders"
 
 # import / export (Postman, OpenAPI 3 / Swagger 2, HAR, curl)
@@ -79,7 +80,7 @@ rspostman docs Shop -f html -o shop.html
 rspostman benchmark https://api.example.com/users -n 100 -c 10        # P10/P50/P90/P95/P99 + req/s
 rspostman benchmark --collection Shop -n 20 --folder "List orders"    # per-request percentiles
 rspostman profile https://api.openai.com/v1/chat/completions \
-    --model gpt-4o-mini --prompt "Say hello" -H "Authorization: Bearer $KEY" -n 5
+    --model gpt-4o-mini --prompt "Say hello" --bearer env:OPENAI_API_KEY -n 5
 ```
 
 `rspostman <command> --help` documents every option. `rspostman echo` starts a small
@@ -103,7 +104,8 @@ reports two failed assertions and exits with status 1 – add `--folder Auth` fo
 | Scripts | Pre-request and test scripts at collection, folder and request level in an embedded JavaScript engine: `pm.test`, `pm.expect` (chai-style), `pm.response`, `pm.request`, all variable scopes, `pm.sendRequest`, `pm.execution.setNextRequest` / `skipRequest`, `pm.cookies`, `pm.info`, `pm.visualizer.set`, legacy `postman.*` / `tests[...]`, `console.*`. See [docs/SCRIPTING.md](docs/SCRIPTING.md) |
 | Collections | Folders, drag-and-drop reordering, duplicate, descriptions, saved examples, collection/folder auth + scripts + variables |
 | Runner | Folder selection, iterations, CSV/JSON data files, delay, bail, flow control, live progress; reports: console, JSON, JUnit XML, HTML |
-| Performance | `benchmark`: latency percentiles P10/P50/P90/P95/P99, req/s, throughput, per-request stats for collections, concurrency; `profile`: LLM streaming health (healthy / degraded / unhealthy), time-to-first-token, output rate (tokens/s or events/s), token usage, captured completions |
+| Performance | `benchmark`: latency percentiles P10/P50/P90/P95/P99, req/s, per-request stats for collections, concurrency (connections are reused; scripts are not run; HTTP 4xx/5xx and unreachable hosts are counted separately); `profile`: health of an OpenAI-compatible streaming endpoint (healthy / degraded / unhealthy), time to first token, output rate (tokens/s or events/s), token usage, captured completions |
+| Credentials | Masked inputs with a reveal button, secret variables, hidden password prompt and `env:NAME` / `@FILE` sources on the CLI, redaction in history, reports and verbose output, owner-only workspace files – see [Handling credentials](#handling-credentials) |
 | Mock servers | Serve saved examples; path variables, example selection by header, dynamic variables in bodies, CORS, request log |
 | Monitors | `rspostman monitor` runs a collection on an interval and appends results to a JSON-lines log |
 | Import / export | Postman Collection v2.0/v2.1, Postman environments/globals, OpenAPI 3, Swagger 2 (JSON/YAML), HAR, curl; export Postman v2.1 |
@@ -121,6 +123,7 @@ rsPostman covers Postman's local, single-user feature set. These parts are **not
 * In scripts: `require()` of external libraries (only `uuid` and `chai` shims), `pm.cookies.jar()` writes, `setInterval`, the visualizer *renderer* (templates are stored, not rendered).
 * HTTP/3. Mock servers match on method + path (+ query as tie-breaker), not on request bodies.
 * Script editors are plain text areas (no syntax highlighting or autocomplete).
+* Encryption of the workspace at rest / OS keychain integration (see [Handling credentials](#handling-credentials)).
 
 ## Workspace layout
 
@@ -129,13 +132,54 @@ rsPostman covers Postman's local, single-user feature set. These parts are **not
   collections/<id>.json     Postman Collection v2.1
   environments/<id>.json    Postman environment
   globals.json  cookies.json  settings.json  state.json
-  history.jsonl             one exchange per line
+  history.jsonl             one exchange per line (credentials redacted)
   monitors/<collection>.jsonl
   uploads/                  files picked in the browser GUI
 ```
 
-Everything is human-readable and safe to put under version control. Secrets you type into
-auth fields or variables are stored in these files as plain text – treat the folder accordingly.
+Everything is human-readable JSON. Collections can go under version control – as long as
+they reference credentials through `{{variables}}` instead of containing them (see below).
+
+## Handling credentials
+
+rsPostman does not encrypt the workspace. What it does is keep credentials out of sight and
+out of the places they tend to leak into:
+
+* **Typing them.** In the GUI, passwords, tokens and keys are shown as dots (auth fields,
+  secret variables, and header / form values whose name looks like a credential such as
+  `Authorization` or `X-Api-Key`); an eye button reveals a value. A value that is only a
+  `{{variable}}` reference is shown as typed. On the command line nothing has to be typed in
+  clear text or end up in the shell history:
+
+  ```bash
+  rspostman send https://api.example.com/me -u bob            # hidden prompt (or RSPOSTMAN_PASSWORD)
+  rspostman send https://api.example.com/me -u bob:env:API_PW # from an environment variable
+  rspostman send https://api.example.com/me --bearer env:API_TOKEN
+  rspostman send https://api.example.com/me --bearer @token.txt
+  rspostman env set prod api_token --secret                   # hidden prompt, or pipe the value in
+  ```
+
+* **Secret variables.** Environment, global and collection variables can be marked *secret*
+  (Postman's `"type": "secret"`; the GUI ticks it automatically for names such as `password`
+  or `api_token`). Secret values are masked in the GUI and in `env show` / `globals list` /
+  `collection show` unless `--show-secrets` is given.
+* **History.** Literal credentials are stored as `<redacted>`: auth helper secrets,
+  `Authorization` / `Cookie` / API-key style headers, sensitive query parameters, password and
+  token fields of JSON and form bodies, `user:password@` in URLs, `Set-Cookie` values and token
+  fields of JSON responses. `{{variable}}` references are kept, so such entries can still be
+  replayed. Turn `history_store_secrets` on in the settings to keep everything.
+* **Reports and output.** Run reports (JSON, JUnit, HTML), benchmark / profile reports and
+  `-v` output are redacted the same way (`--show-secrets` prints them). The "Request" tab of
+  the response viewer hides credentials until *Show credentials* is pressed.
+* **Files.** The workspace directory is created with mode `0700` and every file in it is
+  written with mode `0600` (Unix), so other accounts on the machine cannot read it.
+
+Still plain text on disk, by design of the file formats: whatever you type into a collection,
+environment or the cookie jar. Recommended practice is to keep secrets in an environment
+(marked secret) and reference them as `{{name}}`; then collection files and exports contain no
+secret. Exported environments do contain their values, and generated code snippets contain
+the resolved credentials – that is their purpose. Redaction is name-based: a credential in an
+unusually named field, in free-text bodies or in a URL path is not recognised.
 
 ## Security notes
 

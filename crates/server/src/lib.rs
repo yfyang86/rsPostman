@@ -115,7 +115,7 @@ fn execution_summary(x: &runner::Execution) -> Value {
         "item_id": ex.item_id,
         "name": ex.name,
         "method": ex.request.as_ref().map(|p| p.method.clone()),
-        "url": ex.request.as_ref().map(|p| p.url.clone()),
+        "url": ex.request.as_ref().map(|p| rspostman_core::secrets::redact_url(&p.url)),
         "status": ex.response.as_ref().map(|r| r.status),
         "status_text": ex.response.as_ref().map(|r| r.status_text.clone()),
         "time_ms": ex.response.as_ref().map(|r| r.time_ms),
@@ -373,7 +373,7 @@ impl App {
 
     fn start_benchmark(self: &Arc<Self>, body: Value) -> Result<Value> {
         let iterations = body["iterations"].as_u64().filter(|n| *n > 0).unwrap_or(10) as usize;
-        let concurrency = body["concurrency"].as_u64().filter(|n| *n > 0).unwrap_or(1) as usize;
+        let concurrency = (body["concurrency"].as_u64().filter(|n| *n > 0).unwrap_or(1) as usize).min(profile::MAX_CONCURRENCY);
         let delay_ms = body["delay_ms"].as_u64().unwrap_or(0);
         let env = body.get("environment_id").and_then(|e| e.as_str()).map(|s| s.to_string());
         let mut tasks: Vec<profile::BenchTask> = vec![];
@@ -405,7 +405,7 @@ impl App {
             (None, Some(request)) => {
                 let session = self.session(None, &env)?;
                 let prepared = rspostman_core::http::prepare(&request, request.auth.as_ref(), &session.scopes).map_err(|e| anyhow!("400:{e}"))?;
-                tasks.push(profile::BenchTask { name: format!("{} {}", prepared.method, prepared.url), prepared });
+                tasks.push(profile::BenchTask { name: format!("{} {}", prepared.method, rspostman_core::secrets::redact_url(&prepared.url)), prepared });
             }
             (None, None) => bail!("400:give a collection_id or a request"),
         }
@@ -416,7 +416,13 @@ impl App {
         let cancel = entry.lock().map(|e| e.cancel.clone()).map_err(|_| anyhow!("lock poisoned"))?;
         self.benchmarks.lock().map_err(|_| anyhow!("lock poisoned"))?.insert(id.clone(), entry.clone());
         std::thread::spawn(move || {
-            let on_sample = |_: &profile::BenchSample| {};
+            // live progress for the UI
+            let progress = entry.clone();
+            let on_sample = move |_: &profile::BenchSample| {
+                if let Ok(mut e) = progress.lock() {
+                    e.done_count += 1;
+                }
+            };
             let report = profile::benchmark(&tasks, &settings, iterations, delay_ms, concurrency, Some(&cancel), &on_sample);
             if let Ok(mut e) = entry.lock() {
                 e.done_count = report.samples.len();
@@ -631,9 +637,9 @@ impl App {
                 // body: raw file bytes; ?name=file.ext -> stored under <workspace>/uploads
                 let name: String = req.param("name").unwrap_or("upload.bin").chars().map(|ch| if ch.is_ascii_alphanumeric() || ch == '.' || ch == '-' || ch == '_' { ch } else { '_' }).collect();
                 let dir = self.ws.root.join("uploads");
-                std::fs::create_dir_all(&dir)?;
+                rspostman_core::store::create_private_dir(&dir)?;
                 let path = dir.join(format!("{}-{name}", &rspostman_core::model::new_id()[..8]));
-                std::fs::write(&path, &req.body)?;
+                rspostman_core::store::write_private(&path, &req.body)?;
                 ok(json!({"path": path.display().to_string(), "size": req.body.len()}))
             }
 

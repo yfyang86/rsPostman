@@ -72,7 +72,7 @@ function codeDialog(tab, getRequest) {
     title: "Code snippet",
     wide: true,
     testid: "codegen-dialog",
-    body: [h("div.field-row", h("label.muted", "Language"), select, h("span.muted", "Variables and authorization are resolved with the active environment.")), out],
+    body: [h("div.field-row", h("label.muted", "Language"), select, h("span.muted", "Variables and authorization are resolved with the active environment – the snippet contains the real credentials.")), out],
     buttons: [{ label: "Copy", action: () => { copyText(out.textContent); return false; } }, { label: "Close", primary: true }],
   });
 }
@@ -345,7 +345,7 @@ views.ws = (tab) => {
   drawLog();
   return h("div.page", { testid: "ws" }, h("h2", "WebSocket"), h("div.sub", "Connect to a ws:// or wss:// endpoint, send messages and watch the replies."),
     bar,
-    h("details", { style: "margin-bottom:10px" }, h("summary.muted", { style: "cursor:pointer" }, "Handshake headers"), kvEditor(cfg.headers, { testid: "ws-headers" })),
+    h("details", { style: "margin-bottom:10px" }, h("summary.muted", { style: "cursor:pointer" }, "Handshake headers"), kvEditor(cfg.headers, { testid: "ws-headers", maskSensitive: true })),
     log, h("div", { style: "height:10px" }), composer);
 };
 
@@ -401,6 +401,7 @@ views.settings = (tab) => {
     ["cookies", "Store and send cookies", "bool"],
     ["history_limit", "History entries to keep", "number"],
     ["history_body_limit", "Max response bytes stored per history entry", "number"],
+    ["history_store_secrets", "Keep passwords, tokens and keys in the history (otherwise stored as <redacted>)", "bool"],
   ];
   const draw = () => clear(body, h("div.form-grid", { style: "grid-template-columns: 300px minmax(0, 460px)" }, FIELDS.flatMap(([key, label, kind, hint]) => {
     const id = "set-" + key;

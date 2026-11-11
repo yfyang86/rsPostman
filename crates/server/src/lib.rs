@@ -56,9 +56,15 @@ struct ProfileEntry {
 #[derive(Default)]
 struct BenchEntry {
     done: bool,
+    /// Planned number of requests (0 for a duration-based run).
     total: usize,
-    done_count: usize,
+    names: Vec<String>,
+    opts: rspostman_core::bench::BenchOptions,
+    started: Option<std::time::Instant>,
+    /// Samples so far, for interim results while the run is in progress.
+    live: Vec<rspostman_core::bench::BenchSample>,
     report: Option<BenchReport>,
+    comparison: Option<rspostman_core::bench::Comparison>,
     error: Option<String>,
     cancel: Arc<AtomicBool>,
 }
@@ -388,9 +394,18 @@ impl App {
     }
 
     fn start_benchmark(self: &Arc<Self>, body: Value) -> Result<Value> {
-        let iterations = body["iterations"].as_u64().filter(|n| *n > 0).unwrap_or(10) as usize;
-        let concurrency = (body["concurrency"].as_u64().filter(|n| *n > 0).unwrap_or(1) as usize).min(profile::MAX_CONCURRENCY);
-        let delay_ms = body["delay_ms"].as_u64().unwrap_or(0);
+        use rspostman_core::bench;
+        let opts = bench::BenchOptions {
+            iterations: body["iterations"].as_u64().filter(|n| *n > 0).unwrap_or(10) as usize,
+            duration_ms: body["duration_ms"].as_u64().filter(|n| *n > 0),
+            concurrency: (body["concurrency"].as_u64().filter(|n| *n > 0).unwrap_or(1) as usize).min(bench::MAX_CONCURRENCY),
+            delay_ms: body["delay_ms"].as_u64().unwrap_or(0),
+            rate: body["rate"].as_f64().filter(|r| r.is_finite() && *r > 0.0),
+            warmup: body["warmup"].as_u64().unwrap_or(0).min(1000) as usize,
+            keep_alive: body["keep_alive"].as_bool().unwrap_or(true),
+            thresholds: body["thresholds"].as_array().map(|a| a.iter().filter_map(|t| t.as_str()).map(|t| t.trim().to_string()).filter(|t| !t.is_empty()).collect()).unwrap_or_default(),
+        };
+        bench::validate_thresholds(&opts.thresholds).map_err(|e| anyhow!("400:{e}"))?;
         let env = body.get("environment_id").and_then(|e| e.as_str()).map(|s| s.to_string());
         let mut tasks: Vec<profile::BenchTask> = vec![];
         let adhoc: Option<Request> = serde_json::from_value(body["request"].clone()).ok();
@@ -426,38 +441,65 @@ impl App {
             (None, None) => bail!("400:give a collection_id or a request"),
         }
         let settings = self.session(None, &env)?.settings;
-        let total = tasks.len() * iterations;
+        let total = if opts.duration_ms.is_some() { 0 } else { tasks.len() * opts.iterations };
         let id = rspostman_core::model::new_id();
-        let entry = Arc::new(Mutex::new(BenchEntry { total, ..Default::default() }));
+        let entry = Arc::new(Mutex::new(BenchEntry { total, names: tasks.iter().map(|t| t.name.clone()).collect(), opts: opts.clone(), ..Default::default() }));
         let cancel = entry.lock().map(|e| e.cancel.clone()).map_err(|_| anyhow!("lock poisoned"))?;
         self.benchmarks.lock().map_err(|_| anyhow!("lock poisoned"))?.insert(id.clone(), entry.clone());
+        let duration_ms = opts.duration_ms;
         std::thread::spawn(move || {
-            // live progress for the UI
+            // live samples for the UI's interim results
             let progress = entry.clone();
-            let on_sample = move |_: &profile::BenchSample| {
+            let on_sample = move |sample: &bench::BenchSample| {
                 if let Ok(mut e) = progress.lock() {
-                    e.done_count += 1;
+                    if e.started.is_none() {
+                        e.started = Some(std::time::Instant::now() - std::time::Duration::from_millis(sample.started_ms + sample.time_ms));
+                    }
+                    e.live.push(sample.clone());
                 }
             };
-            let report = profile::benchmark(&tasks, &settings, iterations, delay_ms, concurrency, Some(&cancel), &on_sample);
+            let report = bench::benchmark(&tasks, &settings, &opts, Some(&cancel), &on_sample);
             if let Ok(mut e) = entry.lock() {
-                e.done_count = report.samples.len();
+                e.live = vec![];
                 e.report = Some(report);
                 e.done = true;
             }
         });
-        Ok(json!({ "id": id, "total": total }))
+        Ok(json!({ "id": id, "total": total, "duration_ms": duration_ms }))
     }
 
     fn benchmark_status(&self, id: &str) -> Result<Value> {
+        use rspostman_core::bench;
         let entry = self.benchmarks.lock().map_err(|_| anyhow!("lock poisoned"))?.get(id).cloned().ok_or_else(|| not_found("benchmark"))?;
         let e = entry.lock().map_err(|_| anyhow!("lock poisoned"))?;
+        // What the UI needs: the statistics, plus only the failed samples (not every sample).
+        let slim = |r: &BenchReport| {
+            let mut r = r.clone();
+            r.samples.retain(|s| s.error.is_some());
+            r.samples.truncate(50);
+            r
+        };
+        let (report, done_count) = match &e.report {
+            Some(r) => (Some(slim(r)), r.total_requests),
+            None if e.live.is_empty() => (None, 0),
+            None => {
+                // interim: computed from the samples so far (the most recent 300k on very long runs)
+                let from = e.live.len().saturating_sub(300_000);
+                let elapsed = e.started.map(|s| s.elapsed().as_millis() as u64).unwrap_or(0);
+                // thresholds are judged on the finished run only
+                let opts = bench::BenchOptions { thresholds: vec![], ..e.opts.clone() };
+                (Some(slim(&bench::summarize(&e.names, e.live[from..].to_vec(), &opts, None, elapsed, 0, None))), e.live.len())
+            }
+        };
         Ok(json!({
             "id": id,
             "done": e.done,
             "total": e.total,
-            "done_count": e.done_count,
-            "report": e.report,
+            "duration_ms": e.opts.duration_ms,
+            "elapsed_ms": e.started.map(|s| s.elapsed().as_millis() as u64).unwrap_or(0),
+            "done_count": done_count,
+            "report": report,
+            "comparison": e.comparison,
             "error": e.error,
         }))
     }
@@ -799,6 +841,30 @@ impl App {
                 let entry = self.benchmarks.lock().map_err(|_| lock_err())?.get(*id).cloned().ok_or_else(|| not_found("benchmark"))?;
                 entry.lock().map_err(|_| lock_err())?.cancel.store(true, Ordering::SeqCst);
                 ok(json!({"cancelled": true}))
+            }
+            ("POST", ["benchmark", id, "compare"]) => {
+                // body: { baseline: <JSON report of an earlier run>, tolerance: percent }
+                let body: Value = req.json()?;
+                let baseline: BenchReport = serde_json::from_value(body["baseline"].clone()).map_err(|_| anyhow!("400:the baseline is not a benchmark JSON report"))?;
+                if baseline.total_requests == 0 {
+                    bail!("400:the baseline is not a benchmark JSON report (it contains no requests)");
+                }
+                let entry = self.benchmarks.lock().map_err(|_| lock_err())?.get(*id).cloned().ok_or_else(|| not_found("benchmark"))?;
+                let mut e = entry.lock().map_err(|_| lock_err())?;
+                let current = e.report.as_ref().ok_or_else(|| anyhow!("400:the benchmark has not finished"))?;
+                let c = rspostman_core::bench::compare(&baseline, current, body["tolerance"].as_f64().unwrap_or(10.0));
+                e.comparison = Some(c.clone());
+                ok(json!(c))
+            }
+            ("GET", ["benchmark", id, "report"]) => {
+                let entry = self.benchmarks.lock().map_err(|_| lock_err())?.get(*id).cloned().ok_or_else(|| not_found("benchmark"))?;
+                let e = entry.lock().map_err(|_| lock_err())?;
+                let r = e.report.as_ref().ok_or_else(|| anyhow!("400:the benchmark has not finished"))?;
+                Ok(match req.param("format") {
+                    Some("csv") => Resp::new(200, "text/csv; charset=utf-8", rspostman_core::bench::csv(r)).with("Content-Disposition", "attachment; filename=\"benchmark.csv\""),
+                    Some("json") => Resp::new(200, "application/json", serde_json::to_string_pretty(r)?).with("Content-Disposition", "attachment; filename=\"benchmark.json\""),
+                    _ => Resp::new(200, "text/html; charset=utf-8", rspostman_core::bench_report::html(r, e.comparison.as_ref())),
+                })
             }
 
             // ---------------------------------------------------------- mock servers

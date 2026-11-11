@@ -2,6 +2,8 @@
 #![allow(clippy::large_enum_variant, clippy::unnecessary_sort_by, clippy::redundant_closure_call, clippy::manual_strip)]
 
 pub mod auth;
+pub mod bench;
+pub mod bench_report;
 pub mod codegen;
 pub mod cookies;
 pub mod docs;

@@ -3,7 +3,7 @@
 //! * [`profile_llm`] evaluates the health of an OpenAI-compatible streaming endpoint:
 //!   time to first token, output rate, stream completeness and token usage, repeated
 //!   over several runs and aggregated with percentiles.
-//! * [`benchmark`] repeats one request (or every request of a collection) for a number
+//! * [`benchmark`] (see `crate::bench`) repeats one request (or every request of a collection) for a number
 //!   of iterations and reports latency percentiles (P10/P50/P90/P95/P99), throughput
 //!   and error counts.
 //!
@@ -13,11 +13,9 @@
 
 use crate::http::{self, Prepared, Settings};
 use anyhow::Result;
-use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use std::io::{BufRead, BufReader};
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Instant;
 
 /// Percentile of already-sorted samples with linear interpolation (numpy-style).
@@ -48,9 +46,13 @@ pub struct LatencyStats {
     pub stddev: f64,
     pub p10: f64,
     pub p50: f64,
+    #[serde(default)]
+    pub p75: f64,
     pub p90: f64,
     pub p95: f64,
     pub p99: f64,
+    #[serde(default)]
+    pub p999: f64,
 }
 
 impl LatencyStats {
@@ -71,9 +73,11 @@ impl LatencyStats {
             stddev: var.sqrt(),
             p10: percentile(&v, 10.0),
             p50: percentile(&v, 50.0),
+            p75: percentile(&v, 75.0),
             p90: percentile(&v, 90.0),
             p95: percentile(&v, 95.0),
             p99: percentile(&v, 99.0),
+            p999: percentile(&v, 99.9),
         })
     }
 }
@@ -297,171 +301,8 @@ pub fn profile_llm(p: &Prepared, st: &Settings, iterations: usize, delay_ms: u64
     report
 }
 
-// ---------------------------------------------------------------- benchmark
-
-/// A prepared request with the name shown in reports.
-#[derive(Debug, Clone)]
-pub struct BenchTask {
-    pub name: String,
-    pub prepared: Prepared,
-}
-
-/// One timed request of a benchmark.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
-pub struct BenchSample {
-    pub iteration: usize,
-    pub name: String,
-    pub time_ms: u64,
-    pub status: u16,
-    pub size: usize,
-    /// Transport-level failure (connection refused, timeout, TLS …).
-    pub error: Option<String>,
-}
-
-/// Upper bound for benchmark worker threads.
-pub const MAX_CONCURRENCY: usize = 256;
-
-/// Latency stats of the answered requests of one named task.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
-pub struct NameStats {
-    pub name: String,
-    pub requests: usize,
-    pub errors: usize,
-    pub stats: Option<LatencyStats>,
-}
-
-/// Aggregated result of a benchmark run.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
-pub struct BenchReport {
-    pub started: Option<DateTime<Utc>>,
-    pub duration_ms: u64,
-    /// Configured iterations (per task).
-    pub iterations: usize,
-    pub total_requests: usize,
-    /// Requests that got no response at all.
-    pub errors: usize,
-    /// Responses with a status of 400 or above (they are still timed).
-    #[serde(default)]
-    pub http_errors: usize,
-    pub bytes: usize,
-    pub aborted: Option<String>,
-    /// Latency stats across every answered request.
-    pub overall: Option<LatencyStats>,
-    pub by_name: Vec<NameStats>,
-    pub samples: Vec<BenchSample>,
-}
-
-impl BenchReport {
-    /// Answered requests per second of wall-clock time.
-    pub fn rps(&self) -> f64 {
-        if self.duration_ms == 0 {
-            return 0.0;
-        }
-        (self.total_requests - self.errors) as f64 / (self.duration_ms as f64 / 1000.0)
-    }
-}
-
-/// Run `iterations` rounds of every task and collect timing samples.
-///
-/// With `concurrency` > 1 the work items (iteration × task) are pulled from a shared
-/// counter by that many worker threads; the delay then applies between the requests of
-/// each worker. `cancel` stops the run between requests.
-pub fn benchmark(
-    tasks: &[BenchTask],
-    st: &Settings,
-    iterations: usize,
-    delay_ms: u64,
-    concurrency: usize,
-    cancel: Option<&AtomicBool>,
-    on_sample: &(dyn Fn(&BenchSample) + Sync),
-) -> BenchReport {
-    let started = Utc::now();
-    let clock = Instant::now();
-    let iterations = iterations.max(1);
-    let task_count = tasks.len();
-    let total = task_count * iterations;
-    let samples: Arc<Mutex<Vec<BenchSample>>> = Arc::new(Mutex::new(vec![]));
-    let next = Arc::new(AtomicUsize::new(0));
-    let workers = concurrency.clamp(1, MAX_CONCURRENCY).min(total.max(1));
-    let aborted = Arc::new(Mutex::new(None::<String>));
-    // a poisoned lock only means another worker panicked; the data is still usable
-    fn locked<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
-        m.lock().unwrap_or_else(|e| e.into_inner())
-    }
-    let client = match http::build_client(st) {
-        Ok(c) => c,
-        Err(e) => {
-            return BenchReport { started: Some(started), iterations, aborted: Some(format!("cannot create the HTTP client: {e:#}")), ..Default::default() };
-        }
-    };
-
-    std::thread::scope(|scope| {
-        for _ in 0..workers {
-            let (samples, next, aborted, client) = (samples.clone(), next.clone(), aborted.clone(), client.clone());
-            scope.spawn(move || {
-                let mut first = true;
-                loop {
-                    if cancel.map(|c| c.load(Ordering::SeqCst)).unwrap_or(false) {
-                        *locked(&aborted) = Some("cancelled".into());
-                        break;
-                    }
-                    let item = next.fetch_add(1, Ordering::SeqCst);
-                    if item >= total {
-                        break;
-                    }
-                    if !first && delay_ms > 0 {
-                        std::thread::sleep(std::time::Duration::from_millis(delay_ms));
-                    }
-                    first = false;
-                    let (iteration, task) = (item / task_count, &tasks[item % task_count]);
-                    let sample = match execute_one(&client, task, st) {
-                        Ok((time_ms, status, size)) => BenchSample { iteration, name: task.name.clone(), time_ms, status, size, error: None },
-                        Err(e) => BenchSample { iteration, name: task.name.clone(), time_ms: 0, status: 0, size: 0, error: Some(format!("{e:#}")) },
-                    };
-                    on_sample(&sample);
-                    locked(&samples).push(sample);
-                }
-            });
-        }
-    });
-
-    let mut samples = std::mem::take(&mut *locked(&samples));
-    samples.sort_by_key(|s| (s.iteration, s.name.clone()));
-    let errors = samples.iter().filter(|s| s.error.is_some()).count();
-    let http_errors = samples.iter().filter(|s| s.error.is_none() && s.status >= 400).count();
-    let bytes = samples.iter().map(|s| s.size).sum();
-    let ok: Vec<f64> = samples.iter().filter(|s| s.error.is_none()).map(|s| s.time_ms as f64).collect();
-    let mut by_name: Vec<NameStats> = vec![];
-    for task in tasks {
-        let mine: Vec<f64> = samples
-            .iter()
-            .filter(|s| s.error.is_none() && s.name == task.name)
-            .map(|s| s.time_ms as f64)
-            .collect();
-        let errs = samples.iter().filter(|s| s.error.is_some() && s.name == task.name).count();
-        by_name.push(NameStats { name: task.name.clone(), requests: mine.len(), errors: errs, stats: LatencyStats::of(&mine) });
-    }
-    let aborted = locked(&aborted).clone();
-    BenchReport {
-        started: Some(started),
-        duration_ms: clock.elapsed().as_millis() as u64,
-        iterations,
-        total_requests: samples.len(),
-        errors,
-        http_errors,
-        bytes,
-        aborted,
-        overall: LatencyStats::of(&ok),
-        by_name,
-        samples,
-    }
-}
-
-fn execute_one(client: &reqwest::blocking::Client, task: &BenchTask, st: &Settings) -> Result<(u64, u16, usize)> {
-    let started = Instant::now();
-    let resp = http::execute_with(client, &task.prepared, st, None)?;
-    Ok((started.elapsed().as_millis() as u64, resp.status, resp.size))
-}
+// The request benchmark lives in `crate::bench`; re-exported here for existing callers.
+pub use crate::bench::{benchmark, BenchOptions, BenchReport, BenchSample, BenchTask, NameStats, MAX_CONCURRENCY};
 
 #[cfg(test)]
 mod tests {
@@ -487,29 +328,6 @@ mod tests {
         assert_eq!(s.p50, 25.0);
         assert_eq!(s.p10, 13.0);
         assert!(LatencyStats::of(&[]).is_none());
-    }
-
-    fn task(url: String) -> BenchTask {
-        BenchTask { name: "t".into(), prepared: Prepared { method: "GET".into(), url, ..Default::default() } }
-    }
-
-    #[test]
-    fn benchmark_counts_http_and_transport_errors() {
-        let srv = crate::echo::start("127.0.0.1", 0).unwrap();
-        let st = Settings { no_system_proxy: true, ..Default::default() };
-        let seen = AtomicUsize::new(0);
-        let tasks = vec![task(format!("{}/get", srv.url())), BenchTask { name: "bad".into(), ..task(format!("{}/status/500", srv.url())) }, BenchTask { name: "dead".into(), ..task("http://127.0.0.1:1/".into()) }];
-        let r = benchmark(&tasks, &st, 4, 0, 3, None, &|_| {
-            seen.fetch_add(1, Ordering::SeqCst);
-        });
-        assert_eq!((r.total_requests, r.errors, r.http_errors, seen.load(Ordering::SeqCst)), (12, 4, 4, 12));
-        assert_eq!(r.overall.as_ref().unwrap().count, 8);
-        assert_eq!(r.by_name.iter().map(|n| (n.name.as_str(), n.requests, n.errors)).collect::<Vec<_>>(), [("t", 4, 0), ("bad", 4, 0), ("dead", 0, 4)]);
-        assert!(r.rps() > 0.0);
-        // cancellation is honoured before the first request
-        let cancel = AtomicBool::new(true);
-        let r = benchmark(&tasks[..1], &st, 5, 0, 1, Some(&cancel), &|_| {});
-        assert_eq!((r.total_requests, r.aborted.as_deref()), (0, Some("cancelled")));
     }
 
     #[test]

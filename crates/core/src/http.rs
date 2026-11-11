@@ -249,6 +249,9 @@ pub struct Response {
     #[serde(with = "b64")]
     pub body: Vec<u8>,
     pub time_ms: u64,
+    /// Time until the response headers of the final hop arrived (time to first byte), in ms.
+    #[serde(default)]
+    pub ttfb_ms: u64,
     /// Body size in bytes (after decompression).
     pub size: usize,
     /// Final URL after redirects.
@@ -414,7 +417,13 @@ pub fn prepare(req: &Request, auth: Option<&Auth>, sc: &Scopes) -> Result<Prepar
 /// Build an HTTP client for `st`. Reuse it (see [`execute_with`]) to keep connections alive
 /// across requests.
 pub fn build_client(st: &Settings) -> Result<reqwest::blocking::Client> {
+    build_client_with(st, true)
+}
+
+/// Like [`build_client`]; with `keep_alive` off every request opens a new connection.
+pub fn build_client_with(st: &Settings, keep_alive: bool) -> Result<reqwest::blocking::Client> {
     let mut b = reqwest::blocking::Client::builder()
+        .pool_max_idle_per_host(if keep_alive { usize::MAX } else { 0 })
         .redirect(reqwest::redirect::Policy::none())
         .danger_accept_invalid_certs(!st.verify_ssl)
         .timeout(if st.timeout_ms > 0 { Some(Duration::from_millis(st.timeout_ms)) } else { None })
@@ -492,6 +501,7 @@ pub fn execute_with(client: &reqwest::blocking::Client, p: &Prepared, st: &Setti
             rb = rb.body(b.clone());
         }
         let resp = rb.send().map_err(explain)?;
+        let headers_at = started.elapsed().as_millis() as u64;
         let status = resp.status();
         let resp_headers: Vec<(String, String)> =
             resp.headers().iter().map(|(k, v)| (k.as_str().to_string(), String::from_utf8_lossy(v.as_bytes()).into_owned())).collect();
@@ -552,6 +562,7 @@ pub fn execute_with(client: &reqwest::blocking::Client, p: &Prepared, st: &Setti
             size: bytes.len(),
             body: bytes,
             time_ms: started.elapsed().as_millis() as u64,
+            ttfb_ms: headers_at,
             url: final_url,
             redirects,
             cookies: cookies_set,

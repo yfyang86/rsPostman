@@ -78,7 +78,11 @@ rspostman codegen python -c Shop -r "List orders"
 rspostman docs Shop -f html -o shop.html
 
 # performance: benchmark an endpoint or collection, profile an LLM provider
-rspostman benchmark https://api.example.com/users -n 100 -c 10        # P10/P50/P90/P95/P99 + req/s
+rspostman benchmark https://api.example.com/users -n 100 -c 10        # percentiles, TTFB, req/s
+rspostman benchmark https://api.example.com/users -t 30s --rate 50 -c 8 --warmup 5 \
+    --assert 'p95<200ms' --assert 'error_rate<=1%'                    # fixed time and rate, pass/fail for CI
+rspostman benchmark https://api.example.com/users -n 200 --report-json base.json
+rspostman benchmark https://api.example.com/users -n 200 --compare base.json --report-html bench.html
 rspostman benchmark --collection Shop -n 20 --folder "List orders"    # per-request percentiles
 rspostman profile https://api.openai.com/v1/chat/completions \
     --model gpt-4o-mini --prompt "Say hello" --bearer env:OPENAI_API_KEY -n 5
@@ -95,6 +99,33 @@ rspostman run examples/workflow.postman_collection.json -d examples/users.csv
 (The example contains one deliberately failing request in its `Broken` folder, so the run
 reports two failed assertions and exits with status 1 – add `--folder Auth` for a green run.)
 
+### Benchmarking
+
+```bash
+rspostman benchmark [METHOD] URL | --collection C [--request R | --folder F]
+```
+
+| Option | Meaning |
+|--------|---------|
+| `-n N` / `-t 30s` | N iterations of each request, or run for a fixed time (`500ms`, `30s`, `2m`) |
+| `-c N` | concurrent workers (max 256) |
+| `--rate R` | target R requests per second over all workers; if the workers cannot keep up, the achieved rate in the report is lower |
+| `--delay MS` | pause between the requests of each worker (alternative to `--rate`) |
+| `--warmup N` | N unmeasured rounds first (connection setup, caches) |
+| `--no-keepalive` | new connection for every request |
+| `--assert COND` | threshold, repeatable. Metrics: `min mean max stddev p10 p50 p75 p90 p95 p99 p999`, the same with a `ttfb_` prefix, `error_rate` (%), `errors`, `http_errors`, `rps`, `requests`; operators `< <= > >=`; units `ms`, `s`, `%` |
+| `--compare FILE` `--tolerance P` | compare with the JSON report of an earlier run; a latency metric regresses when it is more than P % (default 10) and more than 1 ms slower, throughput when it drops by more than P % (only judged when both runs lasted at least a second), the error rate when it rises by more than 0.5 points |
+| `--report-json` / `--report-csv` / `--report-html` | full report (also the baseline format), every sample, standalone page with charts |
+
+Exit status: with `--assert`, 0 when every threshold holds; without, 0 when every request was
+answered with a status below 400. A regression against `--compare` always gives 1.
+
+Latency is measured per request from just before it is sent until the body has been read;
+"first byte" is the time until the response headers arrive. Short runs are noisy: compare
+runs of at least several seconds, with the same options, on a quiet machine. The tool is a closed-loop client
+on one machine: it shows how an endpoint responds to this client, not what a fleet of
+independent users would experience, and at high rates the client itself becomes the limit.
+
 ## Feature overview
 
 | Area | What is there |
@@ -105,7 +136,7 @@ reports two failed assertions and exits with status 1 – add `--folder Auth` fo
 | Scripts | Pre-request and test scripts at collection, folder and request level in an embedded JavaScript engine: `pm.test`, `pm.expect` (chai-style), `pm.response`, `pm.request`, all variable scopes, `pm.sendRequest`, `pm.execution.setNextRequest` / `skipRequest`, `pm.cookies`, `pm.info`, `pm.visualizer.set`, legacy `postman.*` / `tests[...]`, `console.*`. See [docs/SCRIPTING.md](docs/SCRIPTING.md) |
 | Collections | Folders, drag-and-drop reordering, duplicate, descriptions, saved examples, collection/folder auth + scripts + variables |
 | Runner | Folder selection, iterations, CSV/JSON data files, delay, bail, flow control, live progress; reports: console, JSON, JUnit XML, HTML |
-| Performance | `benchmark`: latency percentiles P10/P50/P90/P95/P99, req/s, per-request stats for collections, concurrency (connections are reused; scripts are not run; HTTP 4xx/5xx and unreachable hosts are counted separately); `profile`: health of an OpenAI-compatible streaming endpoint (healthy / degraded / unhealthy), time to first token, output rate (tokens/s or events/s), token usage, captured completions |
+| Performance | `benchmark`: a number of iterations or a fixed time, concurrent workers, target request rate, warm-up rounds, keep-alive on/off; reports latency percentiles (P10 … P99.9), time to first byte, requests/s, status codes, a latency distribution and a per-second timeline; pass/fail thresholds (`--assert 'p95<200ms'`) and comparison with a saved baseline for CI; JSON, CSV and standalone HTML reports; live charts in the GUI. Scripts are not run. `profile`: health of an OpenAI-compatible streaming endpoint (healthy / degraded / unhealthy), time to first token, output rate (tokens/s or events/s), token usage, captured completions |
 | Vault | Secrets encrypted at rest (Argon2id + XChaCha20-Poly1305), unlocked with a passphrase, used as `{{vault:name}}`; never written to history, reports, snapshots or exposed to scripts |
 | Credentials | Masked inputs with a reveal button, secret variables, hidden password prompt and `env:NAME` / `@FILE` sources on the CLI, redaction in history, reports and verbose output, owner-only workspace files – see [Handling credentials](#handling-credentials) |
 | Mock servers | Serve saved examples; path variables, example selection by header, dynamic variables in bodies, CORS, request log |

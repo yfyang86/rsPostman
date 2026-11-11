@@ -93,8 +93,19 @@ impl Drop for ServerHandle {
     }
 }
 
+pub type WsStream = tungstenite::WebSocket<Box<dyn tiny_http::ReadWrite + Send>>;
+type WsHandler = Arc<dyn Fn(Req, WsStream) + Send + Sync>;
+
 /// Start a server on `host:port` (`port` 0 picks a free port).
 pub fn serve<F>(host: &str, port: u16, workers: usize, handler: F) -> Result<ServerHandle>
+where
+    F: Fn(Req) -> Resp + Send + Sync + 'static,
+{
+    serve_ws(host, port, workers, handler, None)
+}
+
+/// Like `serve`, additionally accepting WebSocket upgrades (each connection gets its own thread).
+pub fn serve_ws<F>(host: &str, port: u16, workers: usize, handler: F, ws: Option<WsHandler>) -> Result<ServerHandle>
 where
     F: Fn(Req) -> Resp + Send + Sync + 'static,
 {
@@ -105,7 +116,7 @@ where
     let handler = Arc::new(handler);
     let mut threads = vec![];
     for _ in 0..workers.max(1) {
-        let (server, stop, handler) = (server.clone(), stop.clone(), handler.clone());
+        let (server, stop, handler, ws) = (server.clone(), stop.clone(), handler.clone(), ws.clone());
         threads.push(std::thread::spawn(move || {
             while !stop.load(Ordering::SeqCst) {
                 let mut rq = match server.recv() {
@@ -117,8 +128,12 @@ where
                     Some((p, q)) => (p.to_string(), q.to_string()),
                     None => (full.clone(), String::new()),
                 };
+                let wants_upgrade = rq.headers().iter().any(|h| h.field.equiv("Upgrade") && h.value.as_str().eq_ignore_ascii_case("websocket"));
                 let mut body = vec![];
-                let _ = rq.as_reader().read_to_end(&mut body);
+                if !wants_upgrade {
+                    // an upgrade request has no body; reading it would block until the peer closes
+                    let _ = rq.as_reader().read_to_end(&mut body);
+                }
                 let req = Req {
                     method: rq.method().as_str().to_uppercase(),
                     path: percent_encoding::percent_decode_str(&path).decode_utf8_lossy().to_string(),
@@ -127,6 +142,21 @@ where
                     headers: rq.headers().iter().map(|h| (h.field.as_str().as_str().to_string(), h.value.as_str().to_string())).collect(),
                     body,
                 };
+                if let (true, Some(wsh), Some(key)) = (wants_upgrade, ws.clone(), req.header("sec-websocket-key").map(|k| k.to_string())) {
+                    let accept = tungstenite::handshake::derive_accept_key(key.as_bytes());
+                    let mut response = tiny_http::Response::new_empty(tiny_http::StatusCode(101));
+                    for (k, v) in [("Upgrade", "websocket"), ("Connection", "Upgrade"), ("Sec-WebSocket-Accept", accept.as_str())] {
+                        if let Ok(h) = tiny_http::Header::from_bytes(k.as_bytes(), v.as_bytes()) {
+                            response.add_header(h);
+                        }
+                    }
+                    let stream = rq.upgrade("websocket", response);
+                    std::thread::spawn(move || {
+                        let socket = tungstenite::WebSocket::from_raw_socket(stream, tungstenite::protocol::Role::Server, None);
+                        wsh(req, socket);
+                    });
+                    continue;
+                }
                 let resp = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| handler(req)))
                     .unwrap_or_else(|_| Resp::text(500, "internal error"));
                 let mut out = tiny_http::Response::from_data(resp.body).with_status_code(resp.status);

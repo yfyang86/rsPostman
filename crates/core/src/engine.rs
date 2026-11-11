@@ -4,6 +4,7 @@
 use crate::cookies::CookieJar;
 use crate::http::{self, Prepared, Response, Settings};
 use crate::model::{Auth, Collection, Environment, Request};
+use crate::script::{self, Info, LogLine, ScriptContext, TestResult};
 use crate::store::{HistoryEntry, Workspace};
 use crate::vars::Scopes;
 use anyhow::Result;
@@ -17,6 +18,45 @@ pub struct Session {
     pub settings: Settings,
     pub environment: Option<Environment>,
     pub globals: Environment,
+    /// Zero-based iteration index and total, exposed to scripts as `pm.info`.
+    pub iteration: usize,
+    pub iteration_count: usize,
+}
+
+/// Scripts that apply to one request, outermost (collection) first.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct Scripts {
+    #[serde(default)]
+    pub prerequest: Vec<String>,
+    #[serde(default)]
+    pub test: Vec<String>,
+}
+
+impl Scripts {
+    /// Collection, folder and request level scripts of an item.
+    pub fn for_item(collection: &Collection, item_id: &str) -> Scripts {
+        let mut s = Scripts::default();
+        for listen in ["prerequest", "test"] {
+            let mut codes = vec![crate::model::script_of(&collection.event, listen)];
+            for it in collection.trail(item_id).unwrap_or_default() {
+                codes.push(it.script(listen));
+            }
+            codes.retain(|c| !c.trim().is_empty());
+            if listen == "prerequest" {
+                s.prerequest = codes;
+            } else {
+                s.test = codes;
+            }
+        }
+        s
+    }
+}
+
+/// `pm.execution.setNextRequest` outcome.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct Next {
+    /// `None` stops the run.
+    pub name: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -31,6 +71,31 @@ pub struct Exchange {
     pub response: Option<Response>,
     #[serde(default)]
     pub error: Option<String>,
+    #[serde(default)]
+    pub tests: Vec<TestResult>,
+    #[serde(default)]
+    pub console: Vec<LogLine>,
+    /// Uncaught error of a test script.
+    #[serde(default)]
+    pub script_error: Option<String>,
+    /// Set when a script called `setNextRequest`.
+    #[serde(default)]
+    pub next: Option<Next>,
+    /// The request was skipped by `pm.execution.skipRequest()`.
+    #[serde(default)]
+    pub skipped: bool,
+    #[serde(default)]
+    pub visualizer: Option<serde_json::Value>,
+}
+
+impl Exchange {
+    pub fn failed_tests(&self) -> usize {
+        self.tests.iter().filter(|t| !t.passed).count()
+    }
+    /// Network/script error or at least one failed assertion.
+    pub fn failed(&self) -> bool {
+        self.error.is_some() || self.script_error.is_some() || self.failed_tests() > 0
+    }
 }
 
 impl Session {
@@ -54,6 +119,8 @@ impl Session {
             settings,
             environment: env,
             globals,
+            iteration: 0,
+            iteration_count: 1,
         })
     }
 
@@ -86,10 +153,49 @@ impl Session {
         Ok(())
     }
 
-    /// Send a single request with the given (already inherited) auth.
+    /// Send a single request with the given (already inherited) auth, without scripts.
     pub fn send(&mut self, name: &str, req: &Request, auth: Option<&Auth>) -> Exchange {
-        let mut ex = Exchange { id: crate::model::new_id(), name: name.to_string(), ..Default::default() };
-        match http::prepare(req, auth, &self.scopes) {
+        self.run(name, None, "", req, auth, &Scripts::default())
+    }
+
+    /// Full request lifecycle: pre-request scripts, send, test scripts.
+    pub fn run(&mut self, name: &str, item_id: Option<&str>, collection_name: &str, req: &Request, auth: Option<&Auth>, scripts: &Scripts) -> Exchange {
+        let mut ex = Exchange { id: crate::model::new_id(), name: name.to_string(), item_id: item_id.map(|s| s.to_string()), ..Default::default() };
+        let mut req = req.clone();
+        let info = |event: &str, s: &Session| Info {
+            event_name: event.to_string(),
+            iteration: s.iteration,
+            iteration_count: s.iteration_count,
+            request_name: name.to_string(),
+            request_id: item_id.unwrap_or("").to_string(),
+            collection_name: collection_name.to_string(),
+            environment: s.environment.as_ref().map(|e| e.name.clone()).unwrap_or_default(),
+        };
+        let cookies = |s: &Session, req: &Request| -> Vec<(String, String)> {
+            url::Url::parse(&http::build_url(&req.url, &s.scopes))
+                .map(|u| s.jar.matching(&u).iter().map(|c| (c.name.clone(), c.value.clone())).collect())
+                .unwrap_or_default()
+        };
+
+        for code in &scripts.prerequest {
+            let ctx = ScriptContext { info: info("prerequest", self), cookies: cookies(self, &req), scopes: &mut self.scopes, request: &mut req, response: None, settings: &self.settings };
+            let o = script::run(code, ctx);
+            ex.tests.extend(o.tests);
+            ex.console.extend(o.console);
+            if let Some(n) = o.next {
+                ex.next = Some(Next { name: n });
+            }
+            if let Some(e) = o.error {
+                ex.error = Some(format!("pre-request script error: {e}"));
+                return ex;
+            }
+            if o.skip {
+                ex.skipped = true;
+                return ex;
+            }
+        }
+
+        match http::prepare(&req, auth, &self.scopes) {
             Ok(p) => {
                 let jar = if self.settings.cookies { Some(&mut self.jar) } else { None };
                 match http::execute(&p, &self.settings, jar) {
@@ -100,10 +206,29 @@ impl Session {
             }
             Err(e) => ex.error = Some(e.to_string()),
         }
+
+        if let Some(resp) = ex.response.clone() {
+            for code in &scripts.test {
+                let ctx = ScriptContext { info: info("test", self), cookies: cookies(self, &req), scopes: &mut self.scopes, request: &mut req, response: Some(&resp), settings: &self.settings };
+                let o = script::run(code, ctx);
+                ex.tests.extend(o.tests);
+                ex.console.extend(o.console);
+                if let Some(n) = o.next {
+                    ex.next = Some(Next { name: n });
+                }
+                if o.visualizer.is_some() {
+                    ex.visualizer = o.visualizer;
+                }
+                if let Some(e) = o.error {
+                    ex.script_error = Some(format!("test script error: {e}"));
+                    break;
+                }
+            }
+        }
         ex
     }
 
-    /// Send a request stored in a collection (auth is inherited from its parents).
+    /// Run a request stored in a collection (auth and scripts are inherited from its parents).
     pub fn send_item(&mut self, collection: &Collection, item_id: &str) -> Exchange {
         let Some(item) = collection.find(item_id) else {
             return Exchange { id: crate::model::new_id(), error: Some(format!("item `{item_id}` not found")), ..Default::default() };
@@ -112,9 +237,7 @@ impl Session {
             return Exchange { id: crate::model::new_id(), name: item.name.clone(), error: Some("item is a folder".into()), ..Default::default() };
         };
         let auth = collection.effective_auth(item_id);
-        let mut ex = self.send(&item.name, req, auth.as_ref());
-        ex.item_id = Some(item_id.to_string());
-        ex
+        self.run(&item.name, Some(item_id), &collection.info.name, req, auth.as_ref(), &Scripts::for_item(collection, item_id))
     }
 }
 

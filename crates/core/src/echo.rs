@@ -1,6 +1,6 @@
 //! Built-in httpbin-like echo server. Used by the test-suite and handy for trying things offline.
 
-use crate::server::{parse_multipart, serve, Req, Resp, ServerHandle};
+use crate::server::{parse_multipart, serve_ws, Req, Resp, ServerHandle, WsStream};
 use anyhow::Result;
 use md5::{Digest, Md5};
 use serde_json::{json, Map, Value};
@@ -74,7 +74,7 @@ pub fn handle(req: Req) -> Resp {
     let seg = req.segments();
     let m = req.method.as_str();
     match (m, seg.as_slice()) {
-        (_, []) => Resp::json(200, &json!({"name": "rsPostman echo server", "endpoints": ["/get", "/post", "/put", "/patch", "/delete", "/anything", "/status/:code", "/headers", "/basic-auth/:user/:pass", "/bearer", "/digest-auth/:user/:pass", "/cookies", "/cookies/set?k=v", "/cookies/delete?k", "/redirect/:n", "/redirect-to?url=", "/delay/:ms", "/html", "/xml", "/json", "/bytes/:n", "/uuid", "/response-headers?k=v"]})),
+        (_, []) => Resp::json(200, &json!({"name": "rsPostman echo server", "endpoints": ["/get", "/post", "/put", "/patch", "/delete", "/anything", "/status/:code", "/headers", "/basic-auth/:user/:pass", "/bearer", "/digest-auth/:user/:pass", "/cookies", "/cookies/set?k=v", "/cookies/delete?k", "/redirect/:n", "/redirect-to?url=", "/delay/:ms", "/html", "/xml", "/json", "/bytes/:n", "/uuid", "/response-headers?k=v", "ws://.../ws (WebSocket echo)"]})),
         ("GET", ["get"]) | ("POST", ["post"]) | ("PUT", ["put"]) | ("PATCH", ["patch"]) | ("DELETE", ["delete"]) | (_, ["anything", ..]) => {
             Resp::json(200, &echo(&req))
         }
@@ -168,5 +168,23 @@ pub fn handle(req: Req) -> Resp {
 
 /// Start the echo server (`port` 0 = any free port).
 pub fn start(host: &str, port: u16) -> Result<ServerHandle> {
-    serve(host, port, 8, handle)
+    serve_ws(host, port, 8, handle, Some(std::sync::Arc::new(ws_echo)))
+}
+
+/// WebSocket endpoint (any path): greets, then echoes every text and binary message.
+fn ws_echo(req: Req, mut socket: WsStream) {
+    use tungstenite::Message;
+    let _ = socket.send(Message::Text(json!({"event": "connected", "path": req.path}).to_string()));
+    loop {
+        match socket.read() {
+            Ok(m @ (Message::Text(_) | Message::Binary(_))) => {
+                if socket.send(m).is_err() {
+                    break;
+                }
+            }
+            // keep reading after a close frame so the closing handshake completes
+            Err(_) => break,
+            Ok(_) => {}
+        }
+    }
 }

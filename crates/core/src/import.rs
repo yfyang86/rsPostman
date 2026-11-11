@@ -24,22 +24,24 @@ impl Imported {
 }
 
 /// Detect the format of `text` and parse it.
-/// Supported: Postman collection v2.0/v2.1, Postman environment / globals, curl command.
+/// Supported: Postman collection v2.0/v2.1, Postman environment / globals, OpenAPI 3 /
+/// Swagger 2 (JSON or YAML), HAR, curl command.
 pub fn parse(text: &str) -> Result<Imported> {
     let t = text.trim_start_matches('\u{feff}').trim();
     if t.starts_with("curl ") || t.starts_with("curl.exe ") {
         return Ok(Imported::Request(crate::curl::parse(t)?));
     }
     if let Ok(v) = serde_json::from_str::<serde_json::Value>(t) {
+        // OpenAPI documents also have an `info` object, so they must be checked first.
+        if let Some(i) = crate::import_ext::parse_json(&v)? {
+            return Ok(i);
+        }
         if v.get("info").is_some() || v.get("collection").and_then(|c| c.get("info")).is_some() {
             return Ok(Imported::Collection(Collection::from_json(t)?));
         }
         if v.get("values").map(|x| x.is_array()).unwrap_or(false) {
             let env = Environment::from_json(t)?;
             return Ok(if env.scope.as_deref() == Some("globals") { Imported::Globals(env) } else { Imported::Environment(env) });
-        }
-        if let Some(i) = crate::import_ext::parse_json(&v)? {
-            return Ok(i);
         }
         bail!("unrecognised JSON document (expected a Postman collection, environment, OpenAPI/Swagger or HAR file)");
     }

@@ -137,7 +137,11 @@ impl Workspace {
         }
         let p = Path::new(reference);
         if p.is_file() {
-            return Collection::from_json(&std::fs::read_to_string(p)?).with_context(|| format!("cannot load collection file {reference}"));
+            let mut c = Collection::from_json(&std::fs::read_to_string(p)?).with_context(|| format!("cannot load collection file {reference}"))?;
+            // A collection loaded from a file is transient: it must never be mistaken for (and
+            // persisted over) a stored collection that happens to share its id.
+            c.info.id = crate::model::new_id();
+            return Ok(c);
         }
         bail!("collection `{reference}` not found (not an id, a name, or a file)")
     }
@@ -188,7 +192,9 @@ impl Workspace {
         }
         let p = Path::new(reference);
         if p.is_file() {
-            return Environment::from_json(&std::fs::read_to_string(p)?).with_context(|| format!("cannot load environment file {reference}"));
+            let mut e = Environment::from_json(&std::fs::read_to_string(p)?).with_context(|| format!("cannot load environment file {reference}"))?;
+            e.id = crate::model::new_id();
+            return Ok(e);
         }
         bail!("environment `{reference}` not found (not an id, a name, or a file)")
     }
@@ -317,6 +323,12 @@ mod tests {
         assert_ne!(dup.id(), c.id());
         assert!(ws.find_collection("My API").is_err(), "ambiguous name must be rejected");
         assert!(ws.delete_collection(dup.id()).unwrap());
+        // a file with the same id as a stored collection is loaded detached
+        let file = ws.root.join("export.json");
+        std::fs::write(&file, c.to_json()).unwrap();
+        let from_file = ws.find_collection(file.to_str().unwrap()).unwrap();
+        assert_ne!(from_file.id(), c.id());
+        assert!(ws.collection(from_file.id()).unwrap().is_none());
         assert_eq!(ws.collections().unwrap().len(), 1);
 
         let mut e = Environment::new("dev");

@@ -108,6 +108,40 @@ struct ExecArgs {
     no_redirect: bool,
 }
 
+#[derive(Args, Clone, Default)]
+struct RunArgs {
+    /// Run only this folder or request (id, name or path)
+    #[arg(long)]
+    folder: Option<String>,
+    /// Environment (name, id or exported file); default: the active environment
+    #[arg(short, long)]
+    env: Option<String>,
+    /// Override a variable, repeatable
+    #[arg(long = "var", value_name = "KEY=VALUE")]
+    vars: Vec<String>,
+    /// Number of iterations (default: number of data rows, or 1)
+    #[arg(short = 'n', long)]
+    iterations: Option<usize>,
+    /// Iteration data file (CSV with header row, or JSON array of objects)
+    #[arg(short, long, value_name = "FILE")]
+    data: Option<String>,
+    /// Delay between requests in milliseconds
+    #[arg(long, default_value_t = 0, value_name = "MS")]
+    delay: u64,
+    /// Stop at the first failure
+    #[arg(long)]
+    bail: bool,
+    /// Do not save variable changes made by scripts back to the workspace
+    #[arg(long)]
+    no_persist: bool,
+    /// Skip TLS certificate verification
+    #[arg(short = 'k', long)]
+    insecure: bool,
+    /// Request timeout in milliseconds
+    #[arg(long, value_name = "MS")]
+    timeout: Option<u64>,
+}
+
 #[derive(Subcommand)]
 enum Cmd {
     /// Send an ad-hoc request: `send [METHOD] URL`
@@ -144,7 +178,7 @@ enum Cmd {
     /// Cookie jar
     #[command(subcommand)]
     Cookies(CookiesCmd),
-    /// Import a Postman collection / environment file or a curl command (`-` reads stdin)
+    /// Import a Postman collection / environment, OpenAPI / Swagger, HAR file or a curl command (`-` reads stdin)
     Import {
         /// File path, `-` for stdin, or a literal curl command
         source: String,
@@ -179,6 +213,79 @@ enum Cmd {
         req: RequestArgs,
         #[arg(short, long)]
         env: Option<String>,
+    },
+    /// Run a collection (or folder) with its scripts and tests, like Newman
+    Run {
+        /// Collection id, name or exported file
+        collection: String,
+        #[command(flatten)]
+        run: RunArgs,
+        /// Write a JSON report
+        #[arg(long, value_name = "FILE")]
+        report_json: Option<PathBuf>,
+        /// Write a JUnit XML report
+        #[arg(long, value_name = "FILE")]
+        report_junit: Option<PathBuf>,
+        /// Write an HTML report
+        #[arg(long, value_name = "FILE")]
+        report_html: Option<PathBuf>,
+        /// Only print the summary
+        #[arg(short, long)]
+        quiet: bool,
+        /// Print console output and response bodies
+        #[arg(short, long)]
+        verbose: bool,
+    },
+    /// Serve the saved examples of a collection as a local mock server
+    Mock {
+        collection: String,
+        #[arg(short, long, default_value_t = 4010)]
+        port: u16,
+        #[arg(long, default_value = "127.0.0.1")]
+        host: String,
+        #[arg(short, long)]
+        env: Option<String>,
+        /// Delay every response by this many milliseconds
+        #[arg(long, default_value_t = 0)]
+        delay: u64,
+        /// Do not add CORS headers
+        #[arg(long)]
+        no_cors: bool,
+    },
+    /// Run a collection on a schedule and log the results (local monitor)
+    Monitor {
+        collection: String,
+        /// Interval between runs, e.g. `30s`, `5m`, `1h`
+        #[arg(long, default_value = "5m")]
+        every: String,
+        /// Stop after this many runs (default: run until interrupted)
+        #[arg(long)]
+        count: Option<usize>,
+        #[command(flatten)]
+        run: RunArgs,
+    },
+    /// Open a WebSocket connection (interactive, or send -m messages and print the replies)
+    Ws {
+        url: String,
+        #[arg(short = 'H', long = "header", value_name = "NAME:VALUE")]
+        headers: Vec<String>,
+        /// Message to send, repeatable; without it lines are read from stdin
+        #[arg(short, long = "message")]
+        messages: Vec<String>,
+        /// How long to wait for replies after the last -m message (milliseconds)
+        #[arg(long, default_value_t = 1000)]
+        wait: u64,
+        #[arg(short, long)]
+        env: Option<String>,
+    },
+    /// Generate API documentation from a collection
+    Docs {
+        collection: String,
+        /// `md` or `html`
+        #[arg(short, long, default_value = "md")]
+        format: String,
+        #[arg(short, long)]
+        output: Option<PathBuf>,
     },
     /// Show or change settings
     #[command(subcommand)]
@@ -462,7 +569,116 @@ fn report(ex: &Exchange, exec: &ExecArgs) -> Result<i32> {
             }
         }
     }
-    Ok(if exec.fail && r.status >= 400 { 22 } else { 0 })
+    print_script_results(ex, true);
+    Ok(if ex.failed() {
+        1
+    } else if exec.fail && r.status >= 400 {
+        22
+    } else {
+        0
+    })
+}
+
+/// Console output and test results of one exchange (to stderr).
+fn print_script_results(ex: &Exchange, console: bool) {
+    if console {
+        for l in &ex.console {
+            eprintln!("  {} {}", out::dim(&format!("│ {}:", l.level)), l.message);
+        }
+    }
+    for t in &ex.tests {
+        if t.skipped {
+            eprintln!("  {} {}", out::yellow("-"), out::dim(&format!("{} (skipped)", t.name)));
+        } else if t.passed {
+            eprintln!("  {} {}", out::green("✓"), t.name);
+        } else {
+            eprintln!("  {} {}", out::red("✗"), out::red(&t.name));
+            eprintln!("      {}", out::dim(t.error.as_deref().unwrap_or("assertion failed")));
+        }
+    }
+    if let Some(e) = &ex.script_error {
+        eprintln!("  {} {}", out::red("✗"), out::red(e));
+    }
+}
+
+fn load_run(ws: &Workspace, collection: &Collection, a: &RunArgs) -> Result<(Session, rspostman_core::runner::RunOptions)> {
+    let mut session = Session::load(ws, Some(collection), a.env.as_deref())?;
+    for v in &a.vars {
+        let (k, val) = kv(v, '=', "--var")?;
+        session.scopes.local.insert(k, val);
+    }
+    if a.insecure {
+        session.settings.verify_ssl = false;
+    }
+    if let Some(t) = a.timeout {
+        session.settings.timeout_ms = t;
+    }
+    let opts = rspostman_core::runner::RunOptions {
+        folder: match &a.folder {
+            Some(f) => Some(resolve_item(collection, f)?.id.clone()),
+            None => None,
+        },
+        item_ids: None,
+        iterations: a.iterations,
+        data: match &a.data {
+            Some(path) => rspostman_core::runner::load_data(path)?,
+            None => vec![],
+        },
+        delay_ms: a.delay,
+        bail: a.bail,
+    };
+    Ok((session, opts))
+}
+
+fn print_summary(s: &rspostman_core::runner::RunSummary) {
+    use rspostman_core::http::{human_size, human_time};
+    let st = &s.stats;
+    eprintln!();
+    out::table(
+        &["", "EXECUTED", "FAILED"],
+        &[
+            vec!["iterations".into(), st.iterations.to_string(), "-".into()],
+            vec!["requests".into(), st.requests.to_string(), st.requests_failed.to_string()],
+            vec!["assertions".into(), st.tests.to_string(), st.tests_failed.to_string()],
+        ],
+    );
+    println!(
+        "duration {}, average response time {}, received {}",
+        human_time(s.duration_ms),
+        human_time(if st.requests > 0 { st.response_time_ms / st.requests as u64 } else { 0 }),
+        human_size(st.response_bytes)
+    );
+    if let Some(a) = &s.aborted {
+        println!("{}", out::yellow(&format!("run ended early: {a}")));
+    }
+    let mut n = 0;
+    for x in s.executions.iter().filter(|x| x.exchange.failed()) {
+        if n == 0 {
+            println!("\n{}", out::bold("Failures"));
+        }
+        let ex = &x.exchange;
+        for err in ex.error.iter().chain(ex.script_error.iter()) {
+            n += 1;
+            println!("{n:>3}. {} (iteration {})\n     {}", out::red(&x.path), x.iteration + 1, err);
+        }
+        for t in ex.tests.iter().filter(|t| !t.passed) {
+            n += 1;
+            println!("{n:>3}. {} / {} (iteration {})\n     {}", out::red(&x.path), t.name, x.iteration + 1, t.error.as_deref().unwrap_or("assertion failed"));
+        }
+    }
+}
+
+fn parse_interval(s: &str) -> Result<u64> {
+    let s = s.trim();
+    let (num, unit) = s.split_at(s.find(|c: char| !c.is_ascii_digit()).unwrap_or(s.len()));
+    let n: u64 = num.parse().map_err(|_| anyhow!("invalid interval `{s}` (examples: 30s, 5m, 1h)"))?;
+    Ok(match unit {
+        "" | "s" => n,
+        "m" => n * 60,
+        "h" => n * 3600,
+        "ms" => (n / 1000).max(1),
+        _ => bail!("invalid interval unit in `{s}` (use s, m or h)"),
+    })
 }
 
 fn resolve_item<'a>(c: &'a Collection, reference: &str) -> Result<&'a Item> {
@@ -863,7 +1079,7 @@ fn run(cli: Cli) -> Result<i32> {
             }
             HistoryCmd::Show { entry } => {
                 let e = ws.history_entry(&entry)?;
-                let ex = Exchange { id: e.id, item_id: e.item_id, name: e.name.unwrap_or_default(), request: e.request, response: e.response, error: e.error };
+                let ex = Exchange { id: e.id, item_id: e.item_id, name: e.name.unwrap_or_default(), request: e.request, response: e.response, error: e.error, ..Default::default() };
                 report(&ex, &ExecArgs { verbose: true, ..Default::default() })
             }
             HistoryCmd::Replay { entry, exec } => {
@@ -965,6 +1181,210 @@ fn run(cli: Cli) -> Result<i32> {
                 }
             };
             println!("{}", codegen::generate(&lang, &prepared)?);
+            Ok(0)
+        }
+        Cmd::Run { collection, run, report_json, report_junit, report_html, quiet, verbose } => {
+            use rspostman_core::runner::{self, RunEvent};
+            let mut c = ws.find_collection(&collection)?;
+            let (mut session, opts) = load_run(&ws, &c, &run)?;
+            if !quiet {
+                eprintln!("{}", out::bold(&c.info.name));
+            }
+            let summary = runner::run(&c, &mut session, &opts, &mut |ev| {
+                if quiet {
+                    return true;
+                }
+                match ev {
+                    RunEvent::Start { .. } => {}
+                    RunEvent::Iteration { index, total } => {
+                        if total > 1 {
+                            eprintln!("\n{}", out::dim(&format!("Iteration {}/{total}", index + 1)));
+                        }
+                    }
+                    RunEvent::Request(x) => {
+                        let ex = &x.exchange;
+                        eprintln!("\n{} {}", out::bold("→"), out::bold(&x.path));
+                        if let Some(p) = &ex.request {
+                            let meta = match &ex.response {
+                                Some(r) => format!(
+                                    "[{}, {}, {}]",
+                                    out::status(r.status, &r.status_text),
+                                    rspostman_core::http::human_size(r.size),
+                                    rspostman_core::http::human_time(r.time_ms)
+                                ),
+                                None => String::new(),
+                            };
+                            eprintln!("  {} {} {meta}", p.method, out::dim(&p.url));
+                        }
+                        if ex.skipped {
+                            eprintln!("  {}", out::yellow("skipped by pm.execution.skipRequest()"));
+                        }
+                        if let Some(e) = &ex.error {
+                            eprintln!("  {} {}", out::red("✗"), out::red(e));
+                        }
+                        print_script_results(ex, verbose);
+                        if verbose {
+                            if let Some(r) = &ex.response {
+                                for l in out::body_text(r, false).lines().take(60) {
+                                    eprintln!("  {}", out::dim(l));
+                                }
+                            }
+                        }
+                    }
+                }
+                true
+            })?;
+            if !run.no_persist {
+                session.persist(&ws, Some(&mut c))?;
+            }
+            print_summary(&summary);
+            for (path, text) in [
+                (&report_json, rspostman_core::report::json(&summary)),
+                (&report_junit, rspostman_core::report::junit(&summary)),
+                (&report_html, rspostman_core::report::html(&summary)),
+            ] {
+                if let Some(p) = path {
+                    std::fs::write(p, text).with_context(|| format!("cannot write {}", p.display()))?;
+                    eprintln!("report written to {}", p.display());
+                }
+            }
+            Ok(if summary.success() { 0 } else { 1 })
+        }
+        Cmd::Mock { collection, port, host, env, delay, no_cors } => {
+            let c = ws.find_collection(&collection)?;
+            let session = Session::load(&ws, Some(&c), env.as_deref())?;
+            let (srv, routes) = rspostman_core::mock::start(
+                &c,
+                session.scopes,
+                &host,
+                port,
+                rspostman_core::mock::MockOptions { delay_ms: delay, no_cors },
+                Some(Box::new(|line| eprintln!("{line}"))),
+            )?;
+            eprintln!("mock server for `{}` listening on {}  (Ctrl-C to stop)", c.info.name, srv.url());
+            for r in &routes {
+                eprintln!("  {} {}  {}", out::method(&r.method), r.pattern(), out::dim(&format!("{} → {} ({})", r.request_name, r.example.code, r.example.name)));
+            }
+            srv.join();
+            Ok(0)
+        }
+        Cmd::Monitor { collection, every, count, run } => {
+            use std::io::Write;
+            let interval = parse_interval(&every)?;
+            let dir = ws.root.join("monitors");
+            std::fs::create_dir_all(&dir)?;
+            let mut failures = 0;
+            let mut n = 0;
+            loop {
+                n += 1;
+                let mut c = ws.find_collection(&collection)?;
+                let (mut session, opts) = load_run(&ws, &c, &run)?;
+                let summary = rspostman_core::runner::run(&c, &mut session, &opts, &mut |_| true)?;
+                if !run.no_persist {
+                    session.persist(&ws, Some(&mut c))?;
+                }
+                let st = &summary.stats;
+                let ok = summary.success();
+                if !ok {
+                    failures += 1;
+                }
+                println!(
+                    "{} {} run #{n}: {} requests ({} failed), {} assertions ({} failed), {}",
+                    summary.started.with_timezone(&chrono_local()).format("%Y-%m-%d %H:%M:%S"),
+                    if ok { out::green("PASS") } else { out::red("FAIL") },
+                    st.requests,
+                    st.requests_failed,
+                    st.tests,
+                    st.tests_failed,
+                    rspostman_core::http::human_time(summary.duration_ms)
+                );
+                let log = dir.join(format!("{}.jsonl", c.id().chars().map(|ch| if ch.is_ascii_alphanumeric() || ch == '-' { ch } else { '_' }).collect::<String>()));
+                let line = serde_json::json!({"started": summary.started, "success": ok, "duration_ms": summary.duration_ms, "stats": summary.stats, "aborted": summary.aborted,
+                    "failures": summary.executions.iter().filter(|x| x.exchange.failed()).map(|x| serde_json::json!({"request": x.path, "error": x.exchange.error, "tests": x.exchange.tests.iter().filter(|t| !t.passed).map(|t| &t.name).collect::<Vec<_>>()})).collect::<Vec<_>>()});
+                writeln!(std::fs::OpenOptions::new().create(true).append(true).open(&log)?, "{line}")?;
+                if count.map(|c| n >= c).unwrap_or(false) {
+                    eprintln!("monitor log: {}", log.display());
+                    break;
+                }
+                std::thread::sleep(std::time::Duration::from_secs(interval));
+            }
+            Ok(if failures > 0 { 1 } else { 0 })
+        }
+        Cmd::Ws { url, headers, messages, wait, env } => {
+            let session = Session::load(&ws, None, env.as_deref())?;
+            let mut hs = vec![];
+            for h in &headers {
+                let (k, v) = kv(h, ':', "header")?;
+                hs.push((session.scopes.resolve(&k), session.scopes.resolve(&v)));
+            }
+            let client = rspostman_core::ws::WsClient::connect(&session.scopes.resolve(&url), &hs)?;
+            let mut seen = 0;
+            let flush = |client: &rspostman_core::ws::WsClient, seen: &mut usize| {
+                for e in client.events_since(*seen) {
+                    *seen += 1;
+                    let tag = match e.kind.as_str() {
+                        "sent" => out::yellow("↑"),
+                        "message" | "binary" => out::green("↓"),
+                        "error" => out::red("!"),
+                        _ => out::dim("·"),
+                    };
+                    match e.kind.as_str() {
+                        "message" | "binary" => println!("{tag} {}", e.data),
+                        _ => eprintln!("{tag} {} {}", out::dim(&e.kind), e.data),
+                    }
+                }
+            };
+            if !messages.is_empty() {
+                for m in &messages {
+                    client.send(&session.scopes.resolve(m))?;
+                }
+                let end = std::time::Instant::now() + std::time::Duration::from_millis(wait);
+                while std::time::Instant::now() < end && client.is_open() {
+                    flush(&client, &mut seen);
+                    std::thread::sleep(std::time::Duration::from_millis(20));
+                }
+                client.close();
+            } else {
+                eprintln!("{}", out::dim("type a message and press Enter to send; Ctrl-D closes the connection"));
+                let (tx, rx) = std::sync::mpsc::channel::<Option<String>>();
+                std::thread::spawn(move || {
+                    for line in std::io::stdin().lines() {
+                        match line {
+                            Ok(l) => {
+                                if tx.send(Some(l)).is_err() {
+                                    return;
+                                }
+                            }
+                            Err(_) => break,
+                        }
+                    }
+                    let _ = tx.send(None);
+                });
+                while client.is_open() {
+                    match rx.try_recv() {
+                        Ok(Some(l)) if !l.is_empty() => client.send(&l)?,
+                        Ok(None) => client.close(),
+                        _ => {}
+                    }
+                    flush(&client, &mut seen);
+                    std::thread::sleep(std::time::Duration::from_millis(20));
+                }
+            }
+            let end = std::time::Instant::now() + std::time::Duration::from_millis(500);
+            while client.is_open() && std::time::Instant::now() < end {
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            flush(&client, &mut seen);
+            Ok(if client.events_since(0).iter().any(|e| e.kind == "error") { 1 } else { 0 })
+        }
+        Cmd::Docs { collection, format, output } => {
+            let c = ws.find_collection(&collection)?;
+            let text = match format.as_str() {
+                "md" | "markdown" => rspostman_core::docs::markdown(&c),
+                "html" => rspostman_core::docs::html(&c),
+                other => bail!("unknown format `{other}` (use md or html)"),
+            };
+            write_out(text.trim_end(), &output)?;
             Ok(0)
         }
         Cmd::Settings(cmd) => settings_cmd(&ws, cmd),

@@ -1,0 +1,112 @@
+{
+  "info": {
+    "_postman_id": "b7c2f0de-5d0e-4f4f-9a53-000000000001",
+    "name": "Workflow demo",
+    "description": "Demonstrates scripts, variables, auth inheritance, flow control and saved examples.\nPoint `base` at `rspostman echo` (default http://127.0.0.1:8642).",
+    "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json"
+  },
+  "variable": [
+    { "key": "base", "value": "http://127.0.0.1:8642" },
+    { "key": "user", "value": "ann" }
+  ],
+  "auth": { "type": "bearer", "bearer": [{ "key": "token", "value": "{{token}}", "type": "string" }] },
+  "event": [
+    { "listen": "prerequest", "script": { "type": "text/javascript", "exec": ["pm.variables.set('trace', 'trace-' + pm.info.iteration);"] } },
+    { "listen": "test", "script": { "type": "text/javascript", "exec": ["pm.test('collection: responds quickly', () => pm.expect(pm.response.responseTime).to.be.below(5000));"] } }
+  ],
+  "item": [
+    {
+      "name": "Auth",
+      "item": [
+        {
+          "name": "Login",
+          "request": {
+            "method": "POST",
+            "auth": { "type": "noauth" },
+            "header": [{ "key": "X-Trace", "value": "{{trace}}" }],
+            "url": "{{base}}/post",
+            "body": { "mode": "raw", "raw": "{\"user\": \"{{user}}\"}", "options": { "raw": { "language": "json" } } }
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "const body = pm.response.json();",
+                  "pm.test('login echoes the user', () => {",
+                  "  pm.response.to.have.status(200);",
+                  "  pm.expect(body.json.user).to.equal(pm.variables.get('user'));",
+                  "  pm.expect(body.headers['x-trace']).to.equal('trace-' + pm.info.iteration);",
+                  "});",
+                  "pm.collectionVariables.set('token', body.json.user + '-token');",
+                  "console.log('logged in as', body.json.user);"
+                ]
+              }
+            }
+          ],
+          "response": [
+            { "name": "logged in", "status": "OK", "code": 200, "header": [{ "key": "Content-Type", "value": "application/json" }], "body": "{\"token\": \"example-token\", \"request\": \"{{$guid}}\"}" }
+          ]
+        },
+        {
+          "name": "Profile",
+          "request": { "method": "GET", "header": [], "url": "{{base}}/bearer" },
+          "event": [
+            {
+              "listen": "test",
+              "script": { "type": "text/javascript", "exec": ["pm.test('inherited bearer token is sent', () => {", "  pm.expect(pm.response.json().token).to.equal(pm.variables.get('user') + '-token');", "});"] }
+            }
+          ],
+          "response": [
+            { "name": "profile", "status": "OK", "code": 200, "header": [{ "key": "Content-Type", "value": "application/json" }], "body": "{\"name\": \"Ann\", \"plan\": \"pro\"}" },
+            { "name": "unauthorized", "status": "Unauthorized", "code": 401, "header": [{ "key": "Content-Type", "value": "application/json" }], "body": "{\"error\": \"unauthorized\"}" }
+          ]
+        }
+      ]
+    },
+    {
+      "name": "Flow",
+      "item": [
+        {
+          "name": "Loop",
+          "request": { "method": "GET", "auth": { "type": "noauth" }, "header": [], "url": "{{base}}/get?n={{counter}}" },
+          "event": [
+            { "listen": "prerequest", "script": { "type": "text/javascript", "exec": ["if (!pm.variables.has('counter')) pm.variables.set('counter', 1);"] } },
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "const n = parseInt(pm.response.json().args.n, 10);",
+                  "pm.test('loop pass ' + n, () => pm.expect(n).to.be.within(1, 3));",
+                  "if (n < 3) {",
+                  "  pm.variables.set('counter', n + 1);",
+                  "  pm.execution.setNextRequest('Loop');",
+                  "} else {",
+                  "  pm.variables.unset('counter');",
+                  "}"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "Skipped",
+          "request": { "method": "GET", "header": [], "url": "{{base}}/status/500" },
+          "event": [{ "listen": "prerequest", "script": { "type": "text/javascript", "exec": ["pm.execution.skipRequest();"] } }]
+        }
+      ]
+    },
+    {
+      "name": "Broken",
+      "item": [
+        {
+          "name": "Failing",
+          "request": { "method": "GET", "auth": { "type": "noauth" }, "header": [], "url": "{{base}}/status/500" },
+          "event": [{ "listen": "test", "script": { "type": "text/javascript", "exec": ["pm.test('status is 200', () => pm.response.to.have.status(200));", "pm.test('still reports others', () => pm.expect(true).to.be.true);"] } }]
+        }
+      ]
+    }
+  ]
+}

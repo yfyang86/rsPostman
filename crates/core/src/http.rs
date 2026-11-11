@@ -43,6 +43,9 @@ pub struct Settings {
     pub history_limit: usize,
     /// Maximum response body bytes stored per history entry.
     pub history_body_limit: usize,
+    /// Keep literal passwords, tokens and keys in the history. Off by default: the history
+    /// then stores `<redacted>` instead (variable references are always kept).
+    pub history_store_secrets: bool,
 }
 
 impl Default for Settings {
@@ -61,6 +64,7 @@ impl Default for Settings {
             cookies: true,
             history_limit: 500,
             history_body_limit: 512 * 1024,
+            history_store_secrets: false,
         }
     }
 }
@@ -396,10 +400,20 @@ pub fn prepare(req: &Request, auth: Option<&Auth>, sc: &Scopes) -> Result<Prepar
     if let Some(a) = auth {
         crate::auth::apply(a, &mut p, sc)?;
     }
+    // A vault reference that could not be resolved must not be sent to a server as text.
+    let missing = crate::vault::references(&serde_json::to_string(&p).unwrap_or_default());
+    if !missing.is_empty() {
+        return Err(anyhow!(
+            "vault secret `{}` is not available: the vault is locked or has no secret with that name",
+            missing.join("`, `")
+        ));
+    }
     Ok(p)
 }
 
-pub(crate) fn build_client(st: &Settings) -> Result<reqwest::blocking::Client> {
+/// Build an HTTP client for `st`. Reuse it (see [`execute_with`]) to keep connections alive
+/// across requests.
+pub fn build_client(st: &Settings) -> Result<reqwest::blocking::Client> {
     let mut b = reqwest::blocking::Client::builder()
         .redirect(reqwest::redirect::Policy::none())
         .danger_accept_invalid_certs(!st.verify_ssl)
@@ -438,8 +452,12 @@ pub(crate) fn explain(e: reqwest::Error) -> anyhow::Error {
 }
 
 /// Send the request. Redirects, cookies and digest challenges are handled here.
-pub fn execute(p: &Prepared, st: &Settings, mut jar: Option<&mut CookieJar>) -> Result<Response> {
-    let client = build_client(st)?;
+pub fn execute(p: &Prepared, st: &Settings, jar: Option<&mut CookieJar>) -> Result<Response> {
+    execute_with(&build_client(st)?, p, st, jar)
+}
+
+/// Like [`execute`] with a caller-provided client, so repeated requests share its connection pool.
+pub fn execute_with(client: &reqwest::blocking::Client, p: &Prepared, st: &Settings, mut jar: Option<&mut CookieJar>) -> Result<Response> {
     let mut method = p.method.clone();
     let mut url = url::Url::parse(&p.url).map_err(|e| anyhow!("invalid URL `{}`: {e}", p.url))?;
     let mut headers = p.headers.clone();

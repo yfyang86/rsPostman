@@ -50,7 +50,7 @@ views.collection = (tab) => {
         authEditor(draft, { allowInherit: !isCollection, collectionId: tab.collectionId, onChange: () => { dirty(); } }));
     } else if (s === "variables") {
       clear(body, h("p.hint", "Collection variables are available to every request in the collection as {{name}}."),
-        kvEditor(draft.variable, { onChange: dirty, testid: "collection-variables", keyLabel: "Variable", description: true }));
+        kvEditor(draft.variable, { onChange: dirty, testid: "collection-variables", keyLabel: "Variable", description: true, secretType: true }));
     } else if (s === "pre") {
       clear(body, scriptArea("pre", `Runs before every request in this ${isCollection ? "collection" : "folder"}.`));
     } else {
@@ -112,6 +112,7 @@ views.environment = (tab) => {
     isGlobals ? h("h2", "Globals") : h("input.name-input", { type: "text", value: env.name, "aria-label": "Environment name", testid: "environment-name", onInput: (e) => { env.name = e.target.value; dirty(); } }),
     h("div.page-actions", h("button.btn.primary", { testid: "environment-save", onClick: () => tab.save() }, "Save"),
       h("span.muted", isGlobals ? "Global variables are available in every request, whatever environment is active." : "Use variables as {{name}} in URLs, headers, bodies and scripts.")),
-    kvEditor(env.values, { enabledKey: "enabled", onChange: dirty, keyLabel: "Variable", testid: "environment-variables" }),
-    h("p.hint", "Precedence when names clash: local → iteration data → environment → collection → globals."));
+    kvEditor(env.values, { enabledKey: "enabled", onChange: dirty, keyLabel: "Variable", testid: "environment-variables", secretType: true }),
+    h("p.hint", "Precedence when names clash: local → iteration data → environment → collection → globals."),
+    h("p.hint", "Tick “Secret” for passwords, tokens and keys: the value is masked here and in CLI listings. Variables are stored unencrypted in the workspace folder (readable by your user account only) – for encryption at rest, put the value in the vault and set the variable to {{vault:name}}."));
 };

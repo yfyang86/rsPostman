@@ -46,7 +46,12 @@ fn send_adhoc_requests() {
     let h = cli.ok(&["history", "list"]);
     assert!(h.stdout.contains("/bytes/300") && h.stdout.contains("ERR"), "{}", h.stdout);
     assert!(cli.ok(&["history", "show", "1"]).stderr.contains("GET"));
-    assert_eq!(cli.json(&["history", "replay", "8"])["authenticated"], true);
+    // entry 8 was sent with basic auth: the password is not in the history, so it cannot be replayed blindly
+    let replay = cli.run(&["history", "replay", "8"]);
+    assert_eq!(replay.code, 1);
+    assert!(replay.stderr.contains("credentials, which are not stored in the history"), "{}", replay.stderr);
+    // an entry without credentials replays fine
+    assert_eq!(cli.json(&["history", "replay", "5"])["status"], 404);
     cli.ok(&["history", "clear"]);
     assert!(cli.ok(&["history", "list"]).stdout.contains("empty"));
 }

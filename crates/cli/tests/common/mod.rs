@@ -31,6 +31,28 @@ impl Cli {
             .expect("run rspostman");
         Out { code: o.status.code().unwrap_or(-1), stdout: String::from_utf8_lossy(&o.stdout).into(), stderr: String::from_utf8_lossy(&o.stderr).into() }
     }
+    /// Run with extra environment variables and optional stdin.
+    pub fn run_with(&self, args: &[&str], env: &[(&str, &str)], stdin: Option<&str>) -> Out {
+        use std::io::Write;
+        use std::process::Stdio;
+        let mut child = Command::new(env!("CARGO_BIN_EXE_rspostman"))
+            .arg("--workspace")
+            .arg(&self.home)
+            .args(args)
+            .env("NO_COLOR", "1")
+            .env_remove("RSPOSTMAN_PASSWORD")
+            .envs(env.iter().copied())
+            .stdin(if stdin.is_some() { Stdio::piped() } else { Stdio::null() })
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("run rspostman");
+        if let Some(text) = stdin {
+            child.stdin.take().expect("stdin").write_all(text.as_bytes()).expect("write stdin");
+        }
+        let o = child.wait_with_output().expect("wait");
+        Out { code: o.status.code().unwrap_or(-1), stdout: String::from_utf8_lossy(&o.stdout).into(), stderr: String::from_utf8_lossy(&o.stderr).into() }
+    }
     pub fn ok(&self, args: &[&str]) -> Out {
         let o = self.run(args);
         assert_eq!(o.code, 0, "command {args:?} failed\nstdout: {}\nstderr: {}", o.stdout, o.stderr);

@@ -19,12 +19,23 @@ pub fn xml_escape(s: &str) -> String {
     o
 }
 
+/// A copy of the summary without credentials, used by every report format.
+pub fn redacted(summary: &RunSummary) -> RunSummary {
+    let mut s = summary.clone();
+    for x in s.executions.iter_mut() {
+        x.exchange = crate::secrets::redact_exchange(&x.exchange);
+        x.exchange.response = x.exchange.response.as_ref().map(|r| crate::secrets::scrub_response(r, &summary.scrub));
+    }
+    s
+}
+
 pub fn json(summary: &RunSummary) -> String {
-    serde_json::to_string_pretty(summary).unwrap_or_default()
+    serde_json::to_string_pretty(&redacted(summary)).unwrap_or_default()
 }
 
 /// JUnit XML: one `<testsuite>` per request execution, one `<testcase>` per assertion.
 pub fn junit(s: &RunSummary) -> String {
+    let s = &redacted(s);
     let e = xml_escape;
     let mut out = String::from("<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n");
     out.push_str(&format!(
@@ -73,6 +84,7 @@ pub fn junit(s: &RunSummary) -> String {
 }
 
 pub fn html(s: &RunSummary) -> String {
+    let s = &redacted(s);
     let e = xml_escape;
     let st = &s.stats;
     let ok = s.success();

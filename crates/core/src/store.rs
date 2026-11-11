@@ -63,12 +63,52 @@ fn read_json<T: DeserializeOwned>(path: &Path) -> Result<Option<T>> {
     }
 }
 
-/// Atomic write (temp file + rename).
-fn write_file(path: &Path, text: &str) -> Result<()> {
+/// Restrict a file to its owner (the workspace holds credentials). No-op outside Unix.
+pub fn make_private(path: &Path) {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = if path.is_dir() { 0o700 } else { 0o600 };
+        let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode));
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = path;
+    }
+}
+
+/// Create a directory (and parents) that only the owner can enter. Existing directories keep
+/// their permissions – the user may have chosen them on purpose.
+pub fn create_private_dir(path: &Path) -> std::io::Result<()> {
+    if path.is_dir() {
+        return Ok(());
+    }
+    std::fs::create_dir_all(path)?;
+    make_private(path);
+    Ok(())
+}
+
+/// Atomic, owner-only write (temp file + rename).
+pub fn write_private(path: &Path, data: &[u8]) -> Result<()> {
     let tmp = path.with_extension(format!("tmp{}", std::process::id()));
-    std::fs::write(&tmp, text).with_context(|| format!("cannot write {}", tmp.display()))?;
+    {
+        let mut opts = std::fs::OpenOptions::new();
+        opts.write(true).create(true).truncate(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            opts.mode(0o600);
+        }
+        let mut f = opts.open(&tmp).with_context(|| format!("cannot write {}", tmp.display()))?;
+        f.write_all(data).with_context(|| format!("cannot write {}", tmp.display()))?;
+    }
+    make_private(&tmp);
     std::fs::rename(&tmp, path).with_context(|| format!("cannot write {}", path.display()))?;
     Ok(())
+}
+
+fn write_file(path: &Path, text: &str) -> Result<()> {
+    write_private(path, text.as_bytes())
 }
 
 fn write_json<T: Serialize>(path: &Path, v: &T) -> Result<()> {
@@ -82,8 +122,9 @@ impl Workspace {
             .or_else(|| std::env::var_os("RSPOSTMAN_HOME").map(PathBuf::from))
             .or_else(|| dirs::home_dir().map(|h| h.join(".rspostman")))
             .ok_or_else(|| anyhow!("cannot determine workspace directory; pass --workspace"))?;
+        create_private_dir(&root).with_context(|| format!("cannot create workspace at {}", root.display()))?;
         for d in ["collections", "environments"] {
-            std::fs::create_dir_all(root.join(d)).with_context(|| format!("cannot create workspace at {}", root.display()))?;
+            create_private_dir(&root.join(d)).with_context(|| format!("cannot create workspace at {}", root.display()))?;
         }
         Ok(Workspace { root })
     }
@@ -275,7 +316,11 @@ impl Workspace {
             }
         }
         let line = serde_json::to_string(&entry)?;
+        let fresh = !self.history_path().exists();
         let mut f = std::fs::OpenOptions::new().create(true).append(true).open(self.history_path())?;
+        if fresh {
+            make_private(&self.history_path());
+        }
         writeln!(f, "{line}")?;
         drop(f);
         let all = self.history()?;
@@ -339,6 +384,37 @@ mod tests {
         ws.delete_environment(&e.id).unwrap();
         assert!(ws.active_environment().unwrap().is_none());
         std::fs::remove_dir_all(&ws.root).ok();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn workspace_files_are_owner_only() {
+        use std::os::unix::fs::PermissionsExt;
+        let ws = temp_ws();
+        let mode = |p: std::path::PathBuf| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
+        ws.save_collection(&Collection::new("c")).unwrap();
+        ws.save_globals(&ws.globals().unwrap()).unwrap();
+        ws.save_cookies(&CookieJar::default()).unwrap();
+        ws.append_history(
+            HistoryEntry { id: "h".into(), timestamp: Utc::now(), name: None, collection_id: None, item_id: None, source: None, request: None, response: None, error: None },
+            &Settings::default(),
+        )
+        .unwrap();
+        assert_eq!(mode(ws.root.clone()), 0o700);
+        assert_eq!(mode(ws.root.join("collections")), 0o700);
+        for f in ["globals.json", "cookies.json", "history.jsonl"] {
+            assert_eq!(mode(ws.root.join(f)), 0o600, "{f}");
+        }
+        let c = std::fs::read_dir(ws.root.join("collections")).unwrap().next().unwrap().unwrap().path();
+        assert_eq!(mode(c), 0o600);
+        // an existing directory chosen by the user is left alone
+        let shared = std::env::temp_dir().join(format!("rsp-shared-{}", crate::model::new_id()));
+        std::fs::create_dir_all(&shared).unwrap();
+        std::fs::set_permissions(&shared, std::fs::Permissions::from_mode(0o755)).unwrap();
+        Workspace::open(Some(shared.clone())).unwrap();
+        assert_eq!(mode(shared.clone()), 0o755);
+        std::fs::remove_dir_all(&ws.root).ok();
+        std::fs::remove_dir_all(&shared).ok();
     }
 
     #[test]

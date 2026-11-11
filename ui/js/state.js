@@ -12,6 +12,7 @@ export const state = {
   activeEnv: null,
   settings: {},
   languages: [],
+  vault: { exists: false, unlocked: false, names: [] },
   tabs: [],
   activeTabId: null,
   side: "collections",
@@ -45,6 +46,7 @@ export async function loadAll() {
     activeEnv: b.state.active_environment || null,
     settings: b.settings,
     languages: b.languages,
+    vault: b.vault || state.vault,
   });
   emit("collections");
   emit("environments");

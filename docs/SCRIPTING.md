@@ -65,6 +65,10 @@ pm.expect(json).to.be.jsonSchema(schema);   // type, required, properties, items
 
 ## Differences from Postman
 
+* Vault secrets are not available to scripts: `{{vault:name}}` is not resolved by
+  `pm.variables.get` / `replaceIn`, and `pm.request` shows the placeholder. `pm.sendRequest`
+  therefore cannot use vault secrets. (A test script can still see a secret if the *server*
+  echoes it in the response.)
 * `pm.sendRequest` runs synchronously: callbacks are invoked before the call returns and
   promises are already settled.
 * No Node.js or browser APIs, no `require()` of npm packages, no `setInterval`.

@@ -124,6 +124,16 @@ impl Session {
         })
     }
 
+    /// Make the secrets of an unlocked vault available as `{{vault:name}}` for this session.
+    pub fn unlock_vault(&mut self, vault: &crate::vault::Vault) -> Result<()> {
+        self.scopes.vault = vault.all()?;
+        Ok(())
+    }
+
+    pub fn vault_values(&self) -> Vec<String> {
+        self.scopes.vault.values().cloned().collect()
+    }
+
     /// Write cookies and changed variables back to the workspace.
     pub fn persist(&mut self, ws: &Workspace, collection: Option<&mut Collection>) -> Result<()> {
         if self.settings.cookies {
@@ -195,6 +205,7 @@ impl Session {
             }
         }
 
+        self.scopes.vault_used.take();
         match http::prepare(&req, auth, &self.scopes) {
             Ok(p) => {
                 let jar = if self.settings.cookies { Some(&mut self.jar) } else { None };
@@ -205,6 +216,13 @@ impl Session {
                 ex.request = Some(p);
             }
             Err(e) => ex.error = Some(e.to_string()),
+        }
+        // A request that used the vault never exposes those secrets in its snapshot: not to
+        // the GUI, not to verbose output, not to the history or reports.
+        if self.scopes.vault_used.take() {
+            let values = self.vault_values();
+            ex.request = ex.request.as_ref().map(|p| crate::secrets::scrub_prepared(&crate::secrets::redact_prepared(p), &values));
+            ex.error = ex.error.as_ref().map(|e| crate::secrets::scrub_text(e, &values));
         }
 
         if let Some(resp) = ex.response.clone() {
@@ -242,7 +260,14 @@ impl Session {
 }
 
 /// Record an exchange in the workspace history.
-pub fn record(ws: &Workspace, settings: &Settings, ex: &Exchange, source: Option<&Request>, collection_id: Option<&str>) -> Result<()> {
+///
+/// Unless `settings.history_store_secrets` is on, literal credentials are replaced by
+/// `<redacted>` in the stored request, the wire snapshot and the response. Vault secrets are
+/// always removed, wherever they appear.
+pub fn record(ws: &Workspace, session: &Session, ex: &Exchange, source: Option<&Request>, collection_id: Option<&str>) -> Result<()> {
+    let settings = &session.settings;
+    let keep = settings.history_store_secrets;
+    let vault = session.vault_values();
     ws.append_history(
         HistoryEntry {
             id: ex.id.clone(),
@@ -250,10 +275,10 @@ pub fn record(ws: &Workspace, settings: &Settings, ex: &Exchange, source: Option
             name: if ex.name.is_empty() { None } else { Some(ex.name.clone()) },
             collection_id: collection_id.map(|s| s.to_string()),
             item_id: ex.item_id.clone(),
-            source: source.cloned(),
-            request: ex.request.clone(),
-            response: ex.response.clone(),
-            error: ex.error.clone(),
+            source: source.map(|r| if keep { r.clone() } else { crate::secrets::redact_request(r) }),
+            request: ex.request.as_ref().map(|p| crate::secrets::scrub_prepared(&if keep { p.clone() } else { crate::secrets::redact_prepared(p) }, &vault)),
+            response: ex.response.as_ref().map(|r| crate::secrets::scrub_response(&if keep { r.clone() } else { crate::secrets::redact_response(r) }, &vault)),
+            error: ex.error.as_ref().map(|e| crate::secrets::scrub_text(e, &vault)),
         },
         settings,
     )

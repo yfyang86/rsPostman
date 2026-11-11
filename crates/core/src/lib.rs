@@ -18,8 +18,10 @@ pub mod profile;
 pub mod report;
 pub mod runner;
 pub mod script;
+pub mod secrets;
 pub mod store;
 pub mod vars;
+pub mod vault;
 pub mod ws;
 
 pub use engine::{Exchange, Session};

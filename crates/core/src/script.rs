@@ -293,7 +293,11 @@ pub fn run(code: &str, sc: ScriptContext) -> Outcome {
     match eval_string(&mut ctx, "__finish()").map(|s| serde_json::from_str::<Value>(&s)) {
         Ok(Ok(v)) => {
             if let Ok(scopes) = serde_json::from_value::<Scopes>(v["scopes"].clone()) {
+                // the vault is not part of what scripts see; keep it across the round trip
+                let (vault, used) = (std::mem::take(&mut sc.scopes.vault), sc.scopes.vault_used.clone());
                 *sc.scopes = scopes;
+                sc.scopes.vault = vault;
+                sc.scopes.vault_used = used;
             }
             outcome.tests = serde_json::from_value(v["tests"].clone()).unwrap_or_default();
             outcome.console = serde_json::from_value(v["console"].clone()).unwrap_or_default();

@@ -43,6 +43,36 @@ test("profile LLM provider: unhealthy verdict on HTTP errors", async ({ page, ap
   await expect(u.t("profile-run").first()).toContainText("500");
 });
 
+test("profile LLM provider: API key is masked and sent as a bearer token", async ({ page, app }) => {
+  const u = ui(page);
+  await u.t("tool-profile").click();
+  // /bearer answers 401 without a token, 200 (plain JSON, no stream) with one
+  await u.t("profile-url").fill(`${app.echo}/bearer`);
+  await u.t("profile-iterations").fill("1");
+  await u.t("profile-start").click();
+  await expect(u.t("profile-verdict")).toHaveText("unhealthy", { timeout: 15000 });
+  await u.t("profile-key").fill("sk-e2e-key");
+  await expect(u.t("profile-key")).toHaveAttribute("type", "password");
+  await u.t("profile-start").click();
+  await expect(u.t("profile-verdict")).toHaveText("degraded", { timeout: 15000 });
+  await expect(u.t("profile-results")).toContainText("not an event stream");
+  await expect(u.t("profile-run").first()).toContainText("200");
+});
+
+test("benchmark: HTTP errors are counted separately and zero latencies are shown", async ({ page, app }) => {
+  const u = ui(page);
+  await u.t("tool-benchmark").click();
+  await u.t("bench-url").fill(`${app.echo}/status/500`);
+  await u.t("bench-iterations").fill("4");
+  await u.t("bench-concurrency").fill("2");
+  await u.t("benchmark-start").click();
+  await expect(u.t("benchmark-requests")).toHaveText("4", { timeout: 15000 });
+  await expect(u.t("benchmark-errors")).toHaveText("0");
+  await expect(u.t("benchmark-http-errors")).toHaveText("4");
+  // the "all requests" row is listed even when the fastest request took 0 ms
+  await expect(u.t("stats-table").locator("tbody tr")).toHaveCount(2);
+});
+
 test("benchmark: ad-hoc URL with latency percentiles", async ({ page, app }) => {
   const u = ui(page);
   await u.t("tool-benchmark").click();

@@ -74,7 +74,7 @@ pub fn handle(req: Req) -> Resp {
     let seg = req.segments();
     let m = req.method.as_str();
     match (m, seg.as_slice()) {
-        (_, []) => Resp::json(200, &json!({"name": "rsPostman echo server", "endpoints": ["/get", "/post", "/put", "/patch", "/delete", "/anything", "/status/:code", "/headers", "/basic-auth/:user/:pass", "/bearer", "/digest-auth/:user/:pass", "/cookies", "/cookies/set?k=v", "/cookies/delete?k", "/redirect/:n", "/redirect-to?url=", "/delay/:ms", "/html", "/xml", "/json", "/bytes/:n", "/uuid", "/llm (OpenAI-compatible chat stream)", "/response-headers?k=v", "ws://.../ws (WebSocket echo)"]})),
+        (_, []) => Resp::json(200, &json!({"name": "rsPostman echo server", "endpoints": ["/get", "/post", "/put", "/patch", "/delete", "/anything", "/status/:code", "/headers", "/basic-auth/:user/:pass", "/bearer", "/digest-auth/:user/:pass", "/cookies", "/cookies/set?k=v", "/cookies/delete?k", "/redirect/:n", "/redirect-to?url=", "/delay/:ms", "/html", "/xml", "/json", "/bytes/:n", "/uuid", "/llm (OpenAI-compatible chat stream)", "/llm/fail (empty stream)", "/response-headers?k=v", "ws://.../ws (WebSocket echo)"]})),
         ("GET", ["get"]) | ("POST", ["post"]) | ("PUT", ["put"]) | ("PATCH", ["patch"]) | ("DELETE", ["delete"]) | (_, ["anything", ..]) => {
             Resp::json(200, &echo(&req))
         }
@@ -148,10 +148,11 @@ pub fn handle(req: Req) -> Resp {
             Resp::json(200, &json!({"delayed_ms": ms}))
         }
         // OpenAI-compatible chat completion stream (fixed ticker tape) for profiling practice.
-        ("POST", ["llm"]) => {
+        // `/llm/fail` answers with an empty stream (no events, no [DONE]).
+        ("POST", ["llm"] | ["llm", "fail"]) => {
             let req_json: Value = serde_json::from_slice(&req.body).unwrap_or_else(|_| json!({}));
             let model = req_json["model"].as_str().unwrap_or("echo-llm");
-            let tokens = if req.path.ends_with("fail") {
+            let tokens = if seg.len() == 2 {
                 vec![]
             } else {
                 vec!["Hello", ",", " this", " is", " a", " streamed", " test", " reply", " from", " the", " echo", " LLM", "."]

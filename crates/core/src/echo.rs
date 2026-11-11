@@ -74,7 +74,7 @@ pub fn handle(req: Req) -> Resp {
     let seg = req.segments();
     let m = req.method.as_str();
     match (m, seg.as_slice()) {
-        (_, []) => Resp::json(200, &json!({"name": "rsPostman echo server", "endpoints": ["/get", "/post", "/put", "/patch", "/delete", "/anything", "/status/:code", "/headers", "/basic-auth/:user/:pass", "/bearer", "/digest-auth/:user/:pass", "/cookies", "/cookies/set?k=v", "/cookies/delete?k", "/redirect/:n", "/redirect-to?url=", "/delay/:ms", "/html", "/xml", "/json", "/bytes/:n", "/uuid", "/response-headers?k=v", "ws://.../ws (WebSocket echo)"]})),
+        (_, []) => Resp::json(200, &json!({"name": "rsPostman echo server", "endpoints": ["/get", "/post", "/put", "/patch", "/delete", "/anything", "/status/:code", "/headers", "/basic-auth/:user/:pass", "/bearer", "/digest-auth/:user/:pass", "/cookies", "/cookies/set?k=v", "/cookies/delete?k", "/redirect/:n", "/redirect-to?url=", "/delay/:ms", "/html", "/xml", "/json", "/bytes/:n", "/uuid", "/llm (OpenAI-compatible chat stream)", "/llm/fail (empty stream)", "/response-headers?k=v", "ws://.../ws (WebSocket echo)"]})),
         ("GET", ["get"]) | ("POST", ["post"]) | ("PUT", ["put"]) | ("PATCH", ["patch"]) | ("DELETE", ["delete"]) | (_, ["anything", ..]) => {
             Resp::json(200, &echo(&req))
         }
@@ -146,6 +146,40 @@ pub fn handle(req: Req) -> Resp {
             let ms: u64 = ms.parse().unwrap_or(0).min(30_000);
             std::thread::sleep(std::time::Duration::from_millis(ms));
             Resp::json(200, &json!({"delayed_ms": ms}))
+        }
+        // OpenAI-compatible chat completion stream (fixed ticker tape) for profiling practice.
+        // `/llm/fail` answers with an empty stream (no events, no [DONE]).
+        ("POST", ["llm"] | ["llm", "fail"]) => {
+            let req_json: Value = serde_json::from_slice(&req.body).unwrap_or_else(|_| json!({}));
+            let model = req_json["model"].as_str().unwrap_or("echo-llm");
+            let tokens = if seg.len() == 2 {
+                vec![]
+            } else {
+                vec!["Hello", ",", " this", " is", " a", " streamed", " test", " reply", " from", " the", " echo", " LLM", "."]
+            };
+            let chunks: Vec<String> = tokens
+                .iter()
+                .enumerate()
+                .map(|(i, t)| {
+                    let last = i == tokens.len() - 1;
+                    let finish: Value = if last { json!("stop") } else { Value::Null };
+                    let usage = if last {
+                        json!({"prompt_tokens": 9, "completion_tokens": tokens.len(), "total_tokens": 9 + tokens.len()})
+                    } else {
+                        Value::Null
+                    };
+                    format!(
+                        "data: {}\n\n",
+                        json!({"id": "chatcmpl-echo", "object": "chat.completion.chunk", "created": 0, "model": model,
+                               "choices": [{"index": 0, "delta": {"content": t}, "finish_reason": finish}], "usage": usage})
+                    )
+                })
+                .collect();
+            let mut body = chunks.join("");
+            if !tokens.is_empty() {
+                body.push_str("data: [DONE]\n\n");
+            }
+            Resp::new(200, "text/event-stream; charset=utf-8", body)
         }
         (_, ["html"]) => Resp::new(200, "text/html; charset=utf-8", "<!DOCTYPE html><html><head><title>Echo</title></head><body><h1>Hello from rsPostman</h1><p>HTML sample</p></body></html>"),
         (_, ["xml"]) => Resp::new(200, "application/xml", "<?xml version=\"1.0\" encoding=\"UTF-8\"?><slideshow title=\"Sample\"><slide type=\"all\"><title>Hello</title></slide></slideshow>"),

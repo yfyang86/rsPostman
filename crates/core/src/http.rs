@@ -43,6 +43,9 @@ pub struct Settings {
     pub history_limit: usize,
     /// Maximum response body bytes stored per history entry.
     pub history_body_limit: usize,
+    /// Keep literal passwords, tokens and keys in the history. Off by default: the history
+    /// then stores `<redacted>` instead (variable references are always kept).
+    pub history_store_secrets: bool,
 }
 
 impl Default for Settings {
@@ -61,6 +64,7 @@ impl Default for Settings {
             cookies: true,
             history_limit: 500,
             history_body_limit: 512 * 1024,
+            history_store_secrets: false,
         }
     }
 }
@@ -245,6 +249,9 @@ pub struct Response {
     #[serde(with = "b64")]
     pub body: Vec<u8>,
     pub time_ms: u64,
+    /// Time until the response headers of the final hop arrived (time to first byte), in ms.
+    #[serde(default)]
+    pub ttfb_ms: u64,
     /// Body size in bytes (after decompression).
     pub size: usize,
     /// Final URL after redirects.
@@ -396,11 +403,27 @@ pub fn prepare(req: &Request, auth: Option<&Auth>, sc: &Scopes) -> Result<Prepar
     if let Some(a) = auth {
         crate::auth::apply(a, &mut p, sc)?;
     }
+    // A vault reference that could not be resolved must not be sent to a server as text.
+    let missing = crate::vault::references(&serde_json::to_string(&p).unwrap_or_default());
+    if !missing.is_empty() {
+        return Err(anyhow!(
+            "vault secret `{}` is not available: the vault is locked or has no secret with that name",
+            missing.join("`, `")
+        ));
+    }
     Ok(p)
 }
 
-fn build_client(st: &Settings) -> Result<reqwest::blocking::Client> {
+/// Build an HTTP client for `st`. Reuse it (see [`execute_with`]) to keep connections alive
+/// across requests.
+pub fn build_client(st: &Settings) -> Result<reqwest::blocking::Client> {
+    build_client_with(st, true)
+}
+
+/// Like [`build_client`]; with `keep_alive` off every request opens a new connection.
+pub fn build_client_with(st: &Settings, keep_alive: bool) -> Result<reqwest::blocking::Client> {
     let mut b = reqwest::blocking::Client::builder()
+        .pool_max_idle_per_host(if keep_alive { usize::MAX } else { 0 })
         .redirect(reqwest::redirect::Policy::none())
         .danger_accept_invalid_certs(!st.verify_ssl)
         .timeout(if st.timeout_ms > 0 { Some(Duration::from_millis(st.timeout_ms)) } else { None })
@@ -423,7 +446,7 @@ fn build_client(st: &Settings) -> Result<reqwest::blocking::Client> {
     Ok(b.build()?)
 }
 
-fn explain(e: reqwest::Error) -> anyhow::Error {
+pub(crate) fn explain(e: reqwest::Error) -> anyhow::Error {
     let mut msg = e.to_string();
     let mut src = std::error::Error::source(&e);
     while let Some(s) = src {
@@ -438,8 +461,12 @@ fn explain(e: reqwest::Error) -> anyhow::Error {
 }
 
 /// Send the request. Redirects, cookies and digest challenges are handled here.
-pub fn execute(p: &Prepared, st: &Settings, mut jar: Option<&mut CookieJar>) -> Result<Response> {
-    let client = build_client(st)?;
+pub fn execute(p: &Prepared, st: &Settings, jar: Option<&mut CookieJar>) -> Result<Response> {
+    execute_with(&build_client(st)?, p, st, jar)
+}
+
+/// Like [`execute`] with a caller-provided client, so repeated requests share its connection pool.
+pub fn execute_with(client: &reqwest::blocking::Client, p: &Prepared, st: &Settings, mut jar: Option<&mut CookieJar>) -> Result<Response> {
     let mut method = p.method.clone();
     let mut url = url::Url::parse(&p.url).map_err(|e| anyhow!("invalid URL `{}`: {e}", p.url))?;
     let mut headers = p.headers.clone();
@@ -474,6 +501,7 @@ pub fn execute(p: &Prepared, st: &Settings, mut jar: Option<&mut CookieJar>) -> 
             rb = rb.body(b.clone());
         }
         let resp = rb.send().map_err(explain)?;
+        let headers_at = started.elapsed().as_millis() as u64;
         let status = resp.status();
         let resp_headers: Vec<(String, String)> =
             resp.headers().iter().map(|(k, v)| (k.as_str().to_string(), String::from_utf8_lossy(v.as_bytes()).into_owned())).collect();
@@ -534,6 +562,7 @@ pub fn execute(p: &Prepared, st: &Settings, mut jar: Option<&mut CookieJar>) -> 
             size: bytes.len(),
             body: bytes,
             time_ms: started.elapsed().as_millis() as u64,
+            ttfb_ms: headers_at,
             url: final_url,
             redirects,
             cookies: cookies_set,

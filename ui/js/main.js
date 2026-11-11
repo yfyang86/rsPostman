@@ -6,6 +6,9 @@ import { findItem, duplicateItem, walk, newRequest, normalizeRequest } from "./m
 import "./request.js";
 import "./editors.js";
 import "./tools.js";
+import "./perf.js";
+import { openVault } from "./vault.js";
+import { openHelp } from "./help.js";
 
 const $ = (id) => document.getElementById(id);
 
@@ -34,12 +37,20 @@ function renderEnvbar() {
   const select = h("select", { testid: "env-select", "aria-label": "Active environment", onChange: (e) => guard(() => setActiveEnv(e.target.value || null)) },
     h("option", { value: "" }, "No environment"),
     state.environments.map((e) => h("option", { value: e.id, selected: e.id === state.activeEnv }, e.name)));
+  const v = state.vault;
+  const vaultLabel = !v.exists ? "Vault: not set up" : v.unlocked ? "Vault: unlocked" : "Vault: locked";
+  const lockIcon = v.exists && v.unlocked
+    ? '<svg width="16" height="16" viewBox="0 0 16 16" aria-hidden="true"><rect x="3" y="7" width="10" height="7" rx="1.5" fill="none" stroke="currentColor" stroke-width="1.4"/><path d="M5.5 7V4.8a2.5 2.5 0 0 1 4.9-.7" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round"/></svg>'
+    : '<svg width="16" height="16" viewBox="0 0 16 16" aria-hidden="true"><rect x="3" y="7" width="10" height="7" rx="1.5" fill="currentColor" stroke="currentColor" stroke-width="1.4"/><path d="M5.5 7V4.8a2.5 2.5 0 0 1 5 0V7" fill="none" stroke="currentColor" stroke-width="1.4"/></svg>';
   clear($("envbar"),
+    h("button.icon-btn", { title: vaultLabel, "aria-label": vaultLabel, testid: "vault-open", "data-state": !v.exists ? "none" : v.unlocked ? "unlocked" : "locked",
+      style: v.exists && v.unlocked ? "color:var(--ok)" : "", onClick: openVault }, h("span", { html: lockIcon })),
     select,
     h("button.icon-btn", { title: "Edit active environment", "aria-label": "Edit active environment", testid: "env-edit", onClick: () => {
       if (state.activeEnv) openEnvironment(state.activeEnv);
       else { state.side = "environments"; renderSidebar(); }
     } }, h("span", { html: '<svg width="15" height="15" viewBox="0 0 16 16" aria-hidden="true"><path d="M11.5 2.2l2.3 2.3-8 8-3 .7.7-3z" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linejoin="round"/></svg>' })),
+    h("button.icon-btn", { title: "Help (F1)", "aria-label": "Help", testid: "help-open", style: "font-weight:700", onClick: () => openHelp() }, "?"),
     h("button.icon-btn", { title: "Toggle light / dark theme", "aria-label": "Toggle theme", testid: "theme-toggle", onClick: () => applyTheme(document.documentElement.dataset.theme === "dark" ? "light" : "dark") }, h("span", { html: '<svg width="16" height="16" viewBox="0 0 16 16" aria-hidden="true"><circle cx="8" cy="8" r="6.2" fill="none" stroke="currentColor" stroke-width="1.5"/><path d="M8 1.8a6.2 6.2 0 0 1 0 12.4z" fill="currentColor"/></svg>' })));
 }
 
@@ -282,6 +293,7 @@ async function openHistory(id) {
   await guard(async () => {
     const e = await api.get("/history/" + id);
     const source = e.source || (e.exchange.request ? { ...newRequest(e.exchange.request.method, e.exchange.request.url), header: e.exchange.request.headers.map(([key, value]) => ({ key, value })) } : newRequest());
+    if (JSON.stringify(source).includes("<redacted>")) toast("Credentials are not stored in the history – re-enter the fields marked <redacted> before sending.");
     const tab = requestTab({ name: e.name || `${source.method} ${(source.url.raw || source.url || "").toString().replace(/^https?:\/\//, "").slice(0, 40)}`, request: normalizeRequest(clone(source)), exchange: e.exchange, dirty: true });
     openTab(tab);
   });
@@ -361,7 +373,7 @@ function tabIcon(t) {
     const m = t.request.method;
     return h("span.method." + methodClass(m), { style: "width:auto" }, m === "DELETE" ? "DEL" : m.slice(0, 5));
   }
-  return h("span.muted", { style: "font-size:11px" }, { collection: "▣", environment: "◈", runner: "▶", ws: "⇄", mock: "◎", cookies: "◍", settings: "⚙" }[t.kind] || "•");
+  return h("span.muted", { style: "font-size:11px" }, { help: "?", vault: "▮", collection: "▣", environment: "◈", runner: "▶", ws: "⇄", mock: "◎", cookies: "◍", settings: "⚙" }[t.kind] || "•");
 }
 
 function renderTabbar() {
@@ -385,7 +397,7 @@ function renderWorkspace() {
         h("button.btn.primary", { testid: "welcome-new", onClick: () => openNewRequest() }, "New request"),
         h("button.btn", { onClick: createCollection }, "New collection"),
         tools.filter((t) => t.id === "import").map((t) => h("button.btn", { onClick: t.action }, "Import…"))),
-      h("p", { style: "margin-top:18px;font-size:12px" }, h("kbd", "Ctrl"), " + ", h("kbd", "Enter"), " send · ", h("kbd", "Ctrl"), " + ", h("kbd", "S"), " save · ", h("kbd", "Ctrl"), " + ", h("kbd", "N"), " new request")));
+      h("p", { style: "margin-top:18px;font-size:12px" }, h("kbd", "Ctrl"), " + ", h("kbd", "Enter"), " send · ", h("kbd", "Ctrl"), " + ", h("kbd", "S"), " save · ", h("kbd", "Ctrl"), " + ", h("kbd", "N"), " new request · ", h("kbd", "F1"), " ", h("a", { href: "#", testid: "welcome-help", onClick: (e) => { e.preventDefault(); openHelp(); } }, "help"))));
     return;
   }
   if (!tab.el) {
@@ -414,6 +426,7 @@ on("collections", () => {
   if (t && ["runner", "mock"].includes(t.kind) && t.onShow) t.onShow();
 });
 on("environments", () => { renderEnvbar(); renderStatus(); if (state.side === "environments") renderSidebar(); });
+on("vault", renderEnvbar);
 on("history", () => { if (state.side === "history") renderSidebar(); });
 on("tabs", () => { renderTabbar(); renderWorkspace(); if (state.side === "collections") renderSidebar(); });
 on("tabmeta", renderTabbar);
@@ -421,6 +434,7 @@ on("tabmeta", renderTabbar);
 // ---------------------------------------------------------------- global keys, resizer
 
 document.addEventListener("keydown", (e) => {
+  if (e.key === "F1") { e.preventDefault(); openHelp(); return; }
   const mod = e.ctrlKey || e.metaKey;
   if (!mod) return;
   const tab = activeTab();

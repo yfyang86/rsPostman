@@ -54,19 +54,20 @@ struct RequestArgs {
     /// GraphQL variables (JSON)
     #[arg(long, value_name = "JSON")]
     graphql_vars: Option<String>,
-    /// Basic auth
-    #[arg(short = 'u', long = "user", value_name = "USER:PASS")]
+    /// Basic auth. Give only USER to be asked for the password (or set RSPOSTMAN_PASSWORD);
+    /// `USER:env:NAME` reads it from an environment variable
+    #[arg(short = 'u', long = "user", value_name = "USER[:PASS]")]
     user: Option<String>,
-    /// Bearer token
+    /// Bearer token: the literal, `env:NAME`, `@FILE`, or `-` to be asked for it
     #[arg(long, value_name = "TOKEN")]
     bearer: Option<String>,
-    /// API key sent as header
+    /// API key sent as header; the value may be `env:NAME`, `@FILE` or `-` like --bearer
     #[arg(long, value_name = "NAME=VALUE")]
     api_key: Option<String>,
     /// Auth type (noauth, basic, bearer, apikey, digest, oauth1, oauth2, awsv4, jwt) used with --auth-param
     #[arg(long, value_name = "TYPE")]
     auth: Option<String>,
-    /// Auth parameter for --auth, repeatable (e.g. username=bob)
+    /// Auth parameter for --auth, repeatable (e.g. username=bob); secret values may be `env:NAME`
     #[arg(long, value_name = "KEY=VALUE")]
     auth_param: Vec<String>,
 }
@@ -106,6 +107,9 @@ struct ExecArgs {
     /// Do not follow redirects
     #[arg(long)]
     no_redirect: bool,
+    /// Print credentials in verbose output instead of `<redacted>`
+    #[arg(long)]
+    show_secrets: bool,
 }
 
 #[derive(Args, Clone, Default)]
@@ -236,6 +240,116 @@ enum Cmd {
         #[arg(short, long)]
         verbose: bool,
     },
+    /// Benchmark a request or every request of a collection: latency percentiles, time to first
+    /// byte, requests per second, status codes and errors. Can run for a fixed time, at a fixed
+    /// rate, check thresholds and compare with a baseline. Scripts are not run
+    #[command(alias = "bench")]
+    Benchmark {
+        /// Ad-hoc request: `[METHOD] URL`
+        #[arg(num_args = 0..=2, value_name = "[METHOD] URL")]
+        target: Vec<String>,
+        /// Collection id, name or exported file (omit for an ad-hoc request)
+        #[arg(long)]
+        collection: Option<String>,
+        /// Request id, name or `Folder/Name` path (requires a collection)
+        #[arg(short, long, requires = "collection")]
+        request: Option<String>,
+        /// Benchmark only this folder, id, name or path (requires a collection)
+        #[arg(long, conflicts_with = "request")]
+        folder: Option<String>,
+        #[command(flatten)]
+        req: RequestArgs,
+        /// Environment (name, id or exported file); default: the active environment
+        #[arg(short, long)]
+        env: Option<String>,
+        /// Iterations of each request
+        #[arg(short = 'n', long, default_value_t = 10, conflicts_with = "duration")]
+        iterations: usize,
+        /// Run for a fixed time instead of a number of iterations, e.g. `30s`, `2m`, `500ms`
+        #[arg(short = 't', long, value_name = "TIME")]
+        duration: Option<String>,
+        /// Number of concurrent workers (at most 256)
+        #[arg(short = 'c', long, default_value_t = 1)]
+        concurrency: usize,
+        /// Target request rate in requests per second (all workers together)
+        #[arg(long, value_name = "RPS")]
+        rate: Option<f64>,
+        /// Delay between the requests of each worker, in milliseconds
+        #[arg(long, default_value_t = 0, value_name = "MS", conflicts_with = "rate")]
+        delay: u64,
+        /// Unmeasured warm-up rounds before the measurement starts
+        #[arg(long, default_value_t = 0, value_name = "N")]
+        warmup: usize,
+        /// Open a new connection for every request instead of reusing connections
+        #[arg(long)]
+        no_keepalive: bool,
+        /// Pass/fail condition, repeatable: `p95<200ms`, `error_rate<=1%`, `rps>=50`, `ttfb_p99<1s` …
+        /// With thresholds the exit code follows them
+        #[arg(long = "assert", value_name = "CONDITION")]
+        asserts: Vec<String>,
+        /// Compare with a JSON report of an earlier run; exit 1 when this run is worse
+        #[arg(long, value_name = "FILE")]
+        compare: Option<PathBuf>,
+        /// Allowed slow-down (latency) or drop (requests/s) against the baseline, in percent
+        #[arg(long, default_value_t = 10.0, value_name = "PERCENT")]
+        tolerance: f64,
+        /// Skip TLS certificate verification
+        #[arg(short = 'k', long)]
+        insecure: bool,
+        /// Request timeout in milliseconds
+        #[arg(long, value_name = "MS")]
+        timeout: Option<u64>,
+        /// Write a JSON report (usable later as a --compare baseline)
+        #[arg(long, value_name = "FILE")]
+        report_json: Option<PathBuf>,
+        /// Write every sample as CSV
+        #[arg(long, value_name = "FILE")]
+        report_csv: Option<PathBuf>,
+        /// Write a standalone HTML report with charts
+        #[arg(long, value_name = "FILE")]
+        report_html: Option<PathBuf>,
+        /// Only print the summary
+        #[arg(long)]
+        quiet: bool,
+    },
+    /// Profile an LLM provider: streaming health, time to first token, output rate and token usage
+    Profile {
+        /// `[METHOD] URL` of the completions endpoint (OpenAI-compatible)
+        #[arg(required = true, num_args = 1..=2, value_name = "[METHOD] URL")]
+        target: Vec<String>,
+        #[command(flatten)]
+        req: RequestArgs,
+        /// Model for the generated chat body
+        #[arg(long, default_value = "gpt-4o-mini", value_name = "NAME")]
+        model: String,
+        /// User prompt for the generated chat body
+        #[arg(long, default_value = "Say hello in a few words.", value_name = "TEXT")]
+        prompt: String,
+        /// Max tokens for the generated chat body
+        #[arg(long, value_name = "N")]
+        max_tokens: Option<u32>,
+        /// Number of profiling runs (default: 3)
+        #[arg(short = 'n', long, default_value_t = 3)]
+        iterations: usize,
+        /// Delay between runs in milliseconds
+        #[arg(long, default_value_t = 0, value_name = "MS")]
+        delay: u64,
+        /// Environment (name, id or exported file); default: the active environment
+        #[arg(short, long)]
+        env: Option<String>,
+        /// Show the captured completions
+        #[arg(short, long)]
+        verbose: bool,
+        /// Skip TLS certificate verification
+        #[arg(short = 'k', long)]
+        insecure: bool,
+        /// Request timeout in milliseconds
+        #[arg(long, value_name = "MS")]
+        timeout: Option<u64>,
+        /// Write a JSON report
+        #[arg(long, value_name = "FILE")]
+        report_json: Option<PathBuf>,
+    },
     /// Serve the saved examples of a collection as a local mock server
     Mock {
         collection: String,
@@ -295,6 +409,9 @@ enum Cmd {
         #[arg(long)]
         no_open: bool,
     },
+    /// Encrypted local vault for secrets, referenced in requests as `{{vault:NAME}}`
+    #[command(subcommand)]
+    Vault(VaultCmd),
     /// Show or change settings
     #[command(subcommand)]
     Settings(SettingsCmd),
@@ -348,8 +465,15 @@ enum CollectionCmd {
     Move { collection: String, item: String, #[arg(long)] to: Option<String>, #[arg(long)] index: Option<usize> },
     /// Rename a folder or request
     RenameItem { collection: String, item: String, name: String },
-    /// Set a collection variable
-    SetVar { collection: String, key: String, value: String },
+    /// Set a collection variable (omit VALUE to be asked for it without echo)
+    SetVar {
+        collection: String,
+        key: String,
+        value: Option<String>,
+        /// Mark the variable as secret: masked in listings and in the GUI
+        #[arg(long)]
+        secret: bool,
+    },
     /// Remove a collection variable
     UnsetVar { collection: String, key: String },
     /// Set the auth of the collection or of one item (`--auth noauth`, `--auth inherit` ...)
@@ -371,12 +495,25 @@ enum EnvCmd {
     #[command(alias = "ls")]
     List,
     Create { name: String },
-    Show { env: String },
+    Show {
+        env: String,
+        /// Print the values of secret variables
+        #[arg(long)]
+        show_secrets: bool,
+    },
     #[command(alias = "rm")]
     Delete { env: String },
     Rename { env: String, name: String },
     /// Set a variable
-    Set { env: String, key: String, value: String },
+    Set {
+        env: String,
+        key: String,
+        /// Omit to be asked for the value without echo (or pipe it on stdin)
+        value: Option<String>,
+        /// Mark the variable as secret: masked in listings and in the GUI
+        #[arg(long)]
+        secret: bool,
+    },
     /// Remove a variable
     Unset { env: String, key: String },
     /// Select the active environment (`none` clears it)
@@ -386,8 +523,19 @@ enum EnvCmd {
 #[derive(Subcommand)]
 enum VarCmd {
     #[command(alias = "ls")]
-    List,
-    Set { key: String, value: String },
+    List {
+        /// Print the values of secret variables
+        #[arg(long)]
+        show_secrets: bool,
+    },
+    /// Set a variable (omit VALUE to be asked for it without echo)
+    Set {
+        key: String,
+        value: Option<String>,
+        /// Mark the variable as secret: masked in listings and in the GUI
+        #[arg(long)]
+        secret: bool,
+    },
     Unset { key: String },
 }
 
@@ -426,6 +574,27 @@ enum ExportCmd {
 }
 
 #[derive(Subcommand)]
+enum VaultCmd {
+    /// Create the vault (asks for a new passphrase, or takes it from RSPOSTMAN_VAULT_PASSPHRASE)
+    Init,
+    /// Show whether a vault exists and how many secrets it holds
+    Status,
+    /// List secret names (does not need the passphrase)
+    #[command(alias = "ls")]
+    List,
+    /// Store a secret; omit VALUE to be asked for it without echo (or pipe it on stdin).
+    /// Creates the vault on first use
+    Set { name: String, value: Option<String> },
+    /// Print a secret
+    Get { name: String },
+    /// Delete a secret
+    #[command(alias = "rm")]
+    Remove { name: String },
+    /// Change the passphrase (the new one is asked for, or taken from RSPOSTMAN_VAULT_NEW_PASSPHRASE)
+    Passwd,
+}
+
+#[derive(Subcommand)]
 enum SettingsCmd {
     Show,
     /// Set a value, e.g. `settings set timeout_ms 5000`
@@ -445,6 +614,161 @@ fn target(parts: &[String], has_body: bool) -> Result<(String, String)> {
     }
 }
 
+/// Ask for a secret without echoing it (reads one line from stdin when it is not a terminal).
+fn prompt_secret(what: &str) -> Result<String> {
+    use std::io::IsTerminal;
+    if std::io::stdin().is_terminal() {
+        return rpassword::prompt_password(format!("{what}: ")).with_context(|| format!("cannot read {what}"));
+    }
+    let mut line = String::new();
+    std::io::stdin().read_line(&mut line).with_context(|| format!("cannot read {what} from stdin"))?;
+    let value = line.trim_end_matches(['\r', '\n']).to_string();
+    if value.is_empty() {
+        bail!("no {what} given (stdin was empty)");
+    }
+    Ok(value)
+}
+
+const VAULT_ENV: &str = "RSPOSTMAN_VAULT_PASSPHRASE";
+const VAULT_NEW_ENV: &str = "RSPOSTMAN_VAULT_NEW_PASSPHRASE";
+
+/// The vault passphrase: environment variable, else a hidden prompt on a terminal.
+/// It is never read from piped stdin, which may carry a secret value instead.
+fn vault_passphrase(env: &str, prompt: &str) -> Result<String> {
+    use std::io::IsTerminal;
+    if let Ok(p) = std::env::var(env) {
+        return Ok(p);
+    }
+    if !std::io::stdin().is_terminal() {
+        bail!("the vault passphrase is needed: set {env} or run in a terminal to be asked for it");
+    }
+    rpassword::prompt_password(format!("{prompt}: ")).context("cannot read the passphrase")
+}
+
+/// A passphrase for a new vault: from the environment, or asked twice.
+fn new_vault_passphrase(env: &str) -> Result<String> {
+    use std::io::IsTerminal;
+    if let Ok(p) = std::env::var(env) {
+        return Ok(p);
+    }
+    if !std::io::stdin().is_terminal() {
+        bail!("a new vault passphrase is needed: set {env} or run in a terminal to be asked for it");
+    }
+    let first = rpassword::prompt_password("New vault passphrase: ").context("cannot read the passphrase")?;
+    let second = rpassword::prompt_password("Repeat the passphrase: ").context("cannot read the passphrase")?;
+    if first != second {
+        bail!("the passphrases do not match");
+    }
+    Ok(first)
+}
+
+fn open_vault(ws: &Workspace) -> Result<rspostman_core::vault::Vault> {
+    if !rspostman_core::vault::exists(ws) {
+        bail!("this workspace has no vault yet; create one with `rspostman vault init` or `rspostman vault set NAME`");
+    }
+    rspostman_core::vault::Vault::unlock(ws, &vault_passphrase(VAULT_ENV, "Vault passphrase")?)
+}
+
+/// Load a session and, when anything refers to `{{vault:…}}` (the collection, variables or
+/// the command line itself), unlock the vault for it.
+fn load_session(ws: &Workspace, collection: Option<&Collection>, env: Option<&str>) -> Result<Session> {
+    let mut session = Session::load(ws, collection, env)?;
+    let mut text = std::env::args().collect::<Vec<_>>().join("\n");
+    if let Some(c) = collection {
+        text.push_str(&c.to_json());
+    }
+    for scope in [&session.scopes.globals, &session.scopes.collection, &session.scopes.environment] {
+        for v in scope.values() {
+            text.push_str(v);
+            text.push('\n');
+        }
+    }
+    if !rspostman_core::vault::references(&text).is_empty() {
+        session.unlock_vault(&open_vault(ws)?)?;
+    }
+    Ok(session)
+}
+
+fn vault_cmd(ws: &Workspace, cmd: VaultCmd) -> Result<i32> {
+    use rspostman_core::vault::{self, Vault};
+    match cmd {
+        VaultCmd::Init => {
+            if vault::exists(ws) {
+                bail!("a vault already exists in this workspace (use `rspostman vault passwd` to change its passphrase)");
+            }
+            Vault::create(ws, &new_vault_passphrase(VAULT_ENV)?)?;
+            println!("vault created at {}", vault::path(ws).display());
+            println!("There is no way to recover the passphrase: keep it somewhere safe.");
+        }
+        VaultCmd::Status => {
+            if vault::exists(ws) {
+                println!("vault: {} ({} secret(s), locked until the passphrase is given)", vault::path(ws).display(), vault::names(ws)?.len());
+            } else {
+                println!("no vault in this workspace; create one with `rspostman vault init`");
+            }
+        }
+        VaultCmd::List => {
+            let names = vault::names(ws)?;
+            if names.is_empty() {
+                println!("{}", if vault::exists(ws) { "The vault is empty." } else { "No vault in this workspace." });
+            }
+            for n in names {
+                println!("{n}");
+            }
+        }
+        VaultCmd::Set { name, value } => {
+            if !vault::valid_name(&name) {
+                bail!("invalid secret name `{name}` (use letters, digits, `_`, `-` and `.`)");
+            }
+            let mut v = if vault::exists(ws) {
+                open_vault(ws)?
+            } else {
+                eprintln!("No vault yet – creating one.");
+                Vault::create(ws, &new_vault_passphrase(VAULT_ENV)?)?
+            };
+            let value = match value {
+                Some(v) => v,
+                None => prompt_secret(&format!("value for {name}"))?,
+            };
+            v.set(&name, &value)?;
+            println!("stored `{name}`; use it as {{{{vault:{name}}}}}");
+        }
+        VaultCmd::Get { name } => match open_vault(ws)?.get(&name)? {
+            Some(v) => println!("{v}"),
+            None => bail!("the vault has no secret named `{name}`"),
+        },
+        VaultCmd::Remove { name } => {
+            if !open_vault(ws)?.remove(&name)? {
+                bail!("the vault has no secret named `{name}`");
+            }
+            println!("removed `{name}`");
+        }
+        VaultCmd::Passwd => {
+            let mut v = open_vault(ws)?;
+            v.change_passphrase(&new_vault_passphrase(VAULT_NEW_ENV)?)?;
+            println!("passphrase changed; all secrets were re-encrypted");
+        }
+    }
+    Ok(0)
+}
+
+/// Resolve a credential argument so that it does not have to appear on the command line:
+/// `env:NAME` reads an environment variable, `-` asks for it, and – when `allow_file` –
+/// `@FILE` reads a file. Anything else is taken literally.
+fn secret_arg(value: &str, what: &str, allow_file: bool) -> Result<String> {
+    if let Some(name) = value.strip_prefix("env:") {
+        return std::env::var(name).map_err(|_| anyhow!("environment variable `{name}` (for {what}) is not set"));
+    }
+    if value == "-" {
+        return prompt_secret(what);
+    }
+    if let (true, Some(path)) = (allow_file, value.strip_prefix('@')) {
+        let text = std::fs::read_to_string(path).with_context(|| format!("cannot read {what} from {path}"))?;
+        return Ok(text.trim().to_string());
+    }
+    Ok(value.to_string())
+}
+
 fn build_auth(kind: &str, params: &[String]) -> Result<Option<Auth>> {
     if kind == "inherit" {
         return Ok(None);
@@ -455,6 +779,7 @@ fn build_auth(kind: &str, params: &[String]) -> Result<Option<Auth>> {
     let mut a = Auth { kind: kind.to_string(), ..Default::default() };
     for p in params {
         let (k, v) = kv(p, '=', "auth parameter")?;
+        let v = if rspostman_core::secrets::SECRET_AUTH_PARAMS.contains(&k.as_str()) { secret_arg(&v, &k, false)? } else { v };
         a.params.insert(k, v);
     }
     Ok(Some(a))
@@ -522,12 +847,20 @@ fn build_request(parts: &[String], a: &RequestArgs) -> Result<Request> {
         });
     }
     if let Some(u) = &a.user {
-        let (name, pass) = u.split_once(':').unwrap_or((u, ""));
-        req.auth = Some(Auth::new("basic", &[("username", name), ("password", pass)]));
+        let (name, pass) = match u.split_once(':') {
+            Some((name, pass)) => (name.to_string(), secret_arg(pass, "password", false)?),
+            // no password on the command line: environment variable, else ask
+            None => match std::env::var("RSPOSTMAN_PASSWORD") {
+                Ok(pw) => (u.clone(), pw),
+                Err(_) => (u.clone(), prompt_secret(&format!("password for {u}"))?),
+            },
+        };
+        req.auth = Some(Auth::new("basic", &[("username", &name), ("password", &pass)]));
     } else if let Some(t) = &a.bearer {
-        req.auth = Some(Auth::new("bearer", &[("token", t)]));
+        req.auth = Some(Auth::new("bearer", &[("token", &secret_arg(t, "bearer token", true)?)]));
     } else if let Some(k) = &a.api_key {
         let (name, value) = kv(k, '=', "--api-key")?;
+        let value = secret_arg(&value, "API key", true)?;
         req.auth = Some(Auth::new("apikey", &[("key", &name), ("value", &value), ("in", "header")]));
     } else if let Some(t) = &a.auth {
         req.auth = build_auth(t, &a.auth_param)?;
@@ -556,7 +889,11 @@ fn apply_exec(session: &mut Session, exec: &ExecArgs) -> Result<()> {
 fn report(ex: &Exchange, exec: &ExecArgs) -> Result<i32> {
     if exec.verbose {
         if let Some(p) = &ex.request {
-            out::request(p);
+            if exec.show_secrets {
+                out::request(p);
+            } else {
+                out::request(&rspostman_core::secrets::redact_prepared(p));
+            }
         }
     }
     if let Some(e) = &ex.error {
@@ -610,7 +947,7 @@ fn print_script_results(ex: &Exchange, console: bool) {
 }
 
 fn load_run(ws: &Workspace, collection: &Collection, a: &RunArgs) -> Result<(Session, rspostman_core::runner::RunOptions)> {
-    let mut session = Session::load(ws, Some(collection), a.env.as_deref())?;
+    let mut session = load_session(ws, Some(collection), a.env.as_deref())?;
     for v in &a.vars {
         let (k, val) = kv(v, '=', "--var")?;
         session.scopes.local.insert(k, val);
@@ -689,6 +1026,187 @@ fn parse_interval(s: &str) -> Result<u64> {
     })
 }
 
+/// One millisecond value for tables: keep one decimal for small numbers.
+fn fmt_ms(x: f64) -> String {
+    if x < 10.0 {
+        format!("{x:.1}")
+    } else {
+        format!("{x:.0}")
+    }
+}
+
+/// `30s`, `2m`, `500ms`, `1h` -> milliseconds.
+fn parse_duration_ms(s: &str) -> Result<u64> {
+    let t = s.trim().to_lowercase();
+    let (num, unit) = t.split_at(t.find(|c: char| !(c.is_ascii_digit() || c == '.')).unwrap_or(t.len()));
+    let n: f64 = num.parse().map_err(|_| anyhow!("invalid duration `{s}` (examples: 30s, 2m, 500ms)"))?;
+    let ms = match unit {
+        "ms" => n,
+        "" | "s" => n * 1000.0,
+        "m" => n * 60_000.0,
+        "h" => n * 3_600_000.0,
+        _ => bail!("invalid duration unit in `{s}` (use ms, s, m or h)"),
+    };
+    if ms < 1.0 {
+        bail!("the duration must be at least 1 ms");
+    }
+    Ok(ms as u64)
+}
+
+fn stats_cells(s: &rspostman_core::profile::LatencyStats) -> Vec<String> {
+    [s.min, s.p10, s.p50, s.p75, s.p90, s.p95, s.p99, s.p999, s.max, s.mean].iter().map(|v| fmt_ms(*v)).collect()
+}
+
+fn print_bench_summary(r: &rspostman_core::bench::BenchReport, comparison: Option<&rspostman_core::bench::Comparison>) {
+    use rspostman_core::http::{human_size, human_time};
+    println!();
+    match &r.overall {
+        Some(s) => {
+            let mut rows = vec![[vec!["total".to_string()], stats_cells(s)].concat()];
+            if let Some(t) = &r.ttfb {
+                rows.push([vec!["first byte".to_string()], stats_cells(t)].concat());
+            }
+            out::table(&["LATENCY (ms)", "MIN", "P10", "P50", "P75", "P90", "P95", "P99", "P99.9", "MAX", "MEAN"], &rows);
+        }
+        None => println!("{}", out::red("no request was answered")),
+    }
+    if r.by_name.len() > 1 {
+        let rows: Vec<Vec<String>> = r
+            .by_name
+            .iter()
+            .map(|n| {
+                let s = n.stats.as_ref();
+                vec![
+                    n.name.clone(),
+                    n.requests.to_string(),
+                    (n.errors + n.http_errors).to_string(),
+                    s.map(|s| fmt_ms(s.p50)).unwrap_or_else(|| "-".into()),
+                    s.map(|s| fmt_ms(s.p90)).unwrap_or_else(|| "-".into()),
+                    s.map(|s| fmt_ms(s.p99)).unwrap_or_else(|| "-".into()),
+                    s.map(|s| fmt_ms(s.mean)).unwrap_or_else(|| "-".into()),
+                ]
+            })
+            .collect();
+        println!();
+        out::table(&["REQUEST", "ANSWERED", "FAILED", "P50", "P90", "P99", "MEAN"], &rows);
+    }
+    if !r.histogram.is_empty() {
+        println!("\n{}", out::bold("DISTRIBUTION (ms)"));
+        let max = r.histogram.iter().map(|b| b.count).max().unwrap_or(1).max(1);
+        let labels: Vec<String> = r
+            .histogram
+            .iter()
+            .map(|b| match (b.from_ms, b.to_ms) {
+                (_, None) => format!("> {}", b.from_ms),
+                (0, Some(t)) => format!("<= {t}"),
+                (f, Some(t)) => format!("{f} - {t}"),
+            })
+            .collect();
+        let width = labels.iter().map(|l| l.len()).max().unwrap_or(0);
+        for (b, label) in r.histogram.iter().zip(&labels) {
+            let bar = "#".repeat(((b.count * 40) as f64 / max as f64).ceil() as usize);
+            println!("  {label:>width$}  {} {}", out::cyan(&bar), b.count);
+        }
+    }
+    let codes: Vec<String> = r.status_counts.iter().map(|(code, n)| format!("{code} × {n}")).collect();
+    println!(
+        "\n{} requests in {} · {:.2} req/s · {} received · {} failed to connect · {} answered with HTTP 4xx/5xx ({:.2}% errors)",
+        r.total_requests,
+        human_time(r.duration_ms),
+        r.rps(),
+        human_size(r.bytes),
+        r.errors,
+        r.http_errors,
+        r.error_rate
+    );
+    if !codes.is_empty() {
+        println!("status codes: {}", codes.join(", "));
+    }
+    if r.warmup_requests > 0 {
+        println!("{}", out::dim(&format!("{} warm-up request(s) were sent first and are not included", r.warmup_requests)));
+    }
+    if let Some(a) = &r.aborted {
+        println!("{}", out::yellow(a));
+    }
+    if !r.thresholds.is_empty() {
+        println!("\n{}", out::bold("THRESHOLDS"));
+        for t in &r.thresholds {
+            let actual = match (&t.actual, &t.note) {
+                (Some(a), _) => format!("measured {a:.2}"),
+                (None, Some(n)) => n.clone(),
+                _ => String::new(),
+            };
+            println!("  {} {}  {}", if t.passed { out::green("✓") } else { out::red("✗") }, t.expr, out::dim(&actual));
+        }
+    }
+    if let Some(c) = comparison {
+        println!("\n{}", out::bold(&format!("COMPARED WITH THE BASELINE (tolerance {}%)", c.tolerance_pct)));
+        let rows: Vec<Vec<String>> = c
+            .rows
+            .iter()
+            .map(|row| vec![row.metric.clone(), format!("{:.2}", row.baseline), format!("{:.2}", row.current), format!("{:+.1}%", row.change_pct), if row.regression { "REGRESSION".into() } else { "ok".into() }])
+            .collect();
+        out::table(&["METRIC", "BASELINE", "THIS RUN", "CHANGE", ""], &rows);
+    }
+}
+
+fn print_profile_report(r: &rspostman_core::profile::ProfileReport, verbose: bool) {
+    use rspostman_core::http::human_time;
+    let has_usage = r.samples.iter().any(|s| s.usage.is_some());
+    for (i, s) in r.samples.iter().enumerate() {
+        let tag = out::dim(&format!("run {}", i + 1));
+        match &s.error {
+            Some(e) => println!("  {tag}  {} {e}", out::red("ERROR")),
+            None => {
+                let units = if has_usage {
+                    format!("{} completion tokens", s.usage.as_ref().map(|u| u.completion_tokens).unwrap_or(0))
+                } else {
+                    format!("{} events", s.events)
+                };
+                let unit = if has_usage { "tok/s" } else { "evt/s" };
+                println!(
+                    "  {tag}  {}  ttft {}  total {}  {}  {:.1} {}  {}",
+                    out::status(s.status, &s.status_text),
+                    human_time(s.ttfb_ms),
+                    human_time(s.total_ms),
+                    units,
+                    s.rate_per_s,
+                    unit,
+                    out::dim(s.model.as_deref().unwrap_or(""))
+                );
+            }
+        }
+    }
+    let verdict = match r.verdict.as_str() {
+        "healthy" => out::green("healthy"),
+        "degraded" => out::yellow("degraded"),
+        other => out::red(other),
+    };
+    let ok = r.samples.iter().filter(|s| s.error.is_none()).count();
+    println!("\n{} {verdict} ({}/{})", out::bold("Verdict:"), ok, r.samples.len());
+    for n in &r.notes {
+        println!("  {} {n}", out::dim("note:"));
+    }
+    let rows: Vec<Vec<String>> = [("TTFT (ms)", &r.ttfb), ("Total (ms)", &r.total), (if has_usage { "Rate (tok/s)" } else { "Rate (evt/s)" }, &r.rate)]
+        .iter()
+        .filter_map(|(label, s)| {
+            s.as_ref().map(|s| {
+                vec![label.to_string(), fmt_ms(s.min), fmt_ms(s.p50), fmt_ms(s.p90), fmt_ms(s.p99), fmt_ms(s.max), fmt_ms(s.mean)]
+            })
+        })
+        .collect();
+    if !rows.is_empty() {
+        out::table(&["", "MIN", "P50", "P90", "P99", "MAX", "MEAN"], &rows);
+    }
+    if verbose {
+        for (i, s) in r.samples.iter().enumerate() {
+            if !s.completion.is_empty() {
+                println!("\n{} {}", out::dim(&format!("run {} output:", i + 1)), s.completion);
+            }
+        }
+    }
+}
+
 fn resolve_item<'a>(c: &'a Collection, reference: &str) -> Result<&'a Item> {
     c.resolve(reference).ok_or_else(|| anyhow!("`{reference}` not found in collection `{}`", c.info.name))
 }
@@ -724,6 +1242,35 @@ fn print_tree(items: &[Item], depth: usize) {
             _ => println!("{pad}{}", it.name),
         }
     }
+}
+
+const MASK: &str = "********";
+
+/// Rows for `print_vars`, hiding the values of secret variables unless asked not to.
+fn var_rows(env: &Environment, show_secrets: bool) -> Vec<(String, String, bool)> {
+    env.values
+        .iter()
+        .map(|v| {
+            let secret = v.kind.as_deref() == Some("secret");
+            (v.key.clone(), if secret && !show_secrets && !v.value.is_empty() { MASK.to_string() } else { v.value.clone() }, v.enabled)
+        })
+        .collect()
+}
+
+/// Set a variable, asking for the value when it was not given on the command line.
+fn set_var(env: &mut Environment, key: &str, value: Option<String>, secret: bool) -> Result<()> {
+    let value = match value {
+        Some(v) => v,
+        None => prompt_secret(&format!("value for {key}"))?,
+    };
+    env.set(key, &value);
+    if let Some(v) = env.values.iter_mut().find(|v| v.key == key) {
+        // an existing secret marker is kept; it is only removed explicitly in the GUI
+        if secret {
+            v.kind = Some("secret".into());
+        }
+    }
+    Ok(())
 }
 
 fn print_vars(rows: Vec<(String, String, bool)>) {
@@ -764,7 +1311,8 @@ fn collection_cmd(ws: &Workspace, cmd: CollectionCmd) -> Result<i32> {
                 println!("auth: {}", a.kind);
             }
             if !c.variable.is_empty() {
-                println!("variables: {}", c.variable.iter().map(|v| format!("{}={}", v.key, v.value)).collect::<Vec<_>>().join(", "));
+                let shown = |v: &KV| if v.kind.as_deref() == Some("secret") && !v.value.is_empty() { MASK.to_string() } else { v.value.clone() };
+                println!("variables: {}", c.variable.iter().map(|v| format!("{}={}", v.key, shown(v))).collect::<Vec<_>>().join(", "));
             }
             println!();
             print_tree(&c.item, 0);
@@ -833,11 +1381,20 @@ fn collection_cmd(ws: &Workspace, cmd: CollectionCmd) -> Result<i32> {
             ws.save_collection(&c)?;
             println!("renamed to `{name}`");
         }
-        CollectionCmd::SetVar { collection, key, value } => {
+        CollectionCmd::SetVar { collection, key, value, secret } => {
             let mut c = stored(ws, &collection)?;
+            let value = match value {
+                Some(v) => v,
+                None => prompt_secret(&format!("value for {key}"))?,
+            };
             let mut vars = c.variables();
             vars.insert(key.clone(), value);
             c.set_variables(&vars);
+            if secret {
+                if let Some(v) = c.variable.iter_mut().find(|v| v.key == key) {
+                    v.kind = Some("secret".into());
+                }
+            }
             ws.save_collection(&c)?;
             println!("set {key}");
         }
@@ -896,10 +1453,10 @@ fn env_cmd(ws: &Workspace, cmd: EnvCmd) -> Result<i32> {
             ws.save_environment(&e)?;
             println!("created environment `{name}` ({})", e.id);
         }
-        EnvCmd::Show { env } => {
+        EnvCmd::Show { env, show_secrets } => {
             let e = ws.find_environment(&env)?;
             println!("{}  {}", out::bold(&e.name), out::dim(&e.id));
-            print_vars(e.values.iter().map(|v| (v.key.clone(), v.value.clone(), v.enabled)).collect());
+            print_vars(var_rows(&e, show_secrets));
         }
         EnvCmd::Delete { env } => {
             let e = stored_env(ws, &env)?;
@@ -912,9 +1469,9 @@ fn env_cmd(ws: &Workspace, cmd: EnvCmd) -> Result<i32> {
             ws.save_environment(&e)?;
             println!("renamed to `{name}`");
         }
-        EnvCmd::Set { env, key, value } => {
+        EnvCmd::Set { env, key, value, secret } => {
             let mut e = stored_env(ws, &env)?;
-            e.set(&key, &value);
+            set_var(&mut e, &key, value, secret)?;
             ws.save_environment(&e)?;
             println!("set {key}");
         }
@@ -1018,11 +1575,11 @@ fn run(cli: Cli) -> Result<i32> {
     match cli.cmd {
         Cmd::Send { target, req, exec } => {
             let request = build_request(&target, &req)?;
-            let mut s = Session::load(&ws, None, exec.env.as_deref())?;
+            let mut s = load_session(&ws, None, exec.env.as_deref())?;
             apply_exec(&mut s, &exec)?;
             let ex = s.send("", &request, request.auth.as_ref());
             if !exec.no_history {
-                engine::record(&ws, &s.settings, &ex, Some(&request), None)?;
+                engine::record(&ws, &s, &ex, Some(&request), None)?;
             }
             s.persist(&ws, None)?;
             report(&ex, &exec)
@@ -1030,11 +1587,11 @@ fn run(cli: Cli) -> Result<i32> {
         Cmd::Request { collection, request, exec } => {
             let mut c = ws.find_collection(&collection)?;
             let id = resolve_item(&c, &request)?.id.clone();
-            let mut s = Session::load(&ws, Some(&c), exec.env.as_deref())?;
+            let mut s = load_session(&ws, Some(&c), exec.env.as_deref())?;
             apply_exec(&mut s, &exec)?;
             let ex = s.send_item(&c, &id);
             if !exec.no_history {
-                engine::record(&ws, &s.settings, &ex, c.find(&id).and_then(|i| i.request.as_ref()), Some(c.id()))?;
+                engine::record(&ws, &s, &ex, c.find(&id).and_then(|i| i.request.as_ref()), Some(c.id()))?;
             }
             s.persist(&ws, Some(&mut c))?;
             report(&ex, &exec)
@@ -1044,9 +1601,9 @@ fn run(cli: Cli) -> Result<i32> {
         Cmd::Globals(cmd) => {
             let mut g = ws.globals()?;
             match cmd {
-                VarCmd::List => print_vars(g.values.iter().map(|v| (v.key.clone(), v.value.clone(), v.enabled)).collect()),
-                VarCmd::Set { key, value } => {
-                    g.set(&key, &value);
+                VarCmd::List { show_secrets } => print_vars(var_rows(&g, show_secrets)),
+                VarCmd::Set { key, value, secret } => {
+                    set_var(&mut g, &key, value, secret)?;
                     ws.save_globals(&g)?;
                     println!("set {key}");
                 }
@@ -1092,12 +1649,25 @@ fn run(cli: Cli) -> Result<i32> {
             }
             HistoryCmd::Replay { entry, exec } => {
                 let e = ws.history_entry(&entry)?;
-                let source = e.source.ok_or_else(|| anyhow!("history entry has no replayable request"))?;
+                let mut source = e.source.ok_or_else(|| anyhow!("history entry has no replayable request"))?;
                 let collection = match &e.collection_id {
                     Some(id) => ws.collection(id)?,
                     None => None,
                 };
-                let mut s = Session::load(&ws, collection.as_ref(), exec.env.as_deref())?;
+                if rspostman_core::secrets::was_redacted(&source) {
+                    // credentials are not kept in the history; a saved request still has them
+                    let saved = collection.as_ref().zip(e.item_id.as_ref()).and_then(|(c, id)| c.find(id)).and_then(|i| i.request.clone());
+                    match saved {
+                        Some(r) => {
+                            eprintln!("{}", out::dim("credentials are not stored in the history; replaying the saved request from the collection"));
+                            source = r;
+                        }
+                        None => bail!(
+                            "this entry was sent with credentials, which are not stored in the history.\n       Send the request again with its credentials, or keep them in future entries with\n       `rspostman settings set history_store_secrets true`."
+                        ),
+                    }
+                }
+                let mut s = load_session(&ws, collection.as_ref(), exec.env.as_deref())?;
                 apply_exec(&mut s, &exec)?;
                 let auth = match (&collection, &e.item_id) {
                     (Some(c), Some(id)) if source.auth.is_none() => c.effective_auth(id),
@@ -1106,7 +1676,7 @@ fn run(cli: Cli) -> Result<i32> {
                 let mut ex = s.send(e.name.as_deref().unwrap_or(""), &source, auth.as_ref());
                 ex.item_id = e.item_id.clone();
                 if !exec.no_history {
-                    engine::record(&ws, &s.settings, &ex, Some(&source), e.collection_id.as_deref())?;
+                    engine::record(&ws, &s, &ex, Some(&source), e.collection_id.as_deref())?;
                 }
                 s.persist(&ws, None)?;
                 report(&ex, &exec)
@@ -1176,7 +1746,7 @@ fn run(cli: Cli) -> Result<i32> {
                     let c = ws.find_collection(&cr)?;
                     let item = resolve_item(&c, &rr)?;
                     let r = item.request.as_ref().ok_or_else(|| anyhow!("`{rr}` is a folder"))?;
-                    let s = Session::load(&ws, Some(&c), env.as_deref())?;
+                    let s = load_session(&ws, Some(&c), env.as_deref())?;
                     rspostman_core::http::prepare(r, c.effective_auth(&item.id).as_ref(), &s.scopes)?
                 }
                 _ => {
@@ -1184,7 +1754,7 @@ fn run(cli: Cli) -> Result<i32> {
                         bail!("give either --collection/--request or `[METHOD] URL`");
                     }
                     let r = build_request(&target, &req)?;
-                    let s = Session::load(&ws, None, env.as_deref())?;
+                    let s = load_session(&ws, None, env.as_deref())?;
                     rspostman_core::http::prepare(&r, r.auth.as_ref(), &s.scopes)?
                 }
             };
@@ -1258,9 +1828,182 @@ fn run(cli: Cli) -> Result<i32> {
             }
             Ok(if summary.success() { 0 } else { 1 })
         }
+        Cmd::Benchmark {
+            collection, request, folder, target, req, env, iterations, duration, concurrency, rate, delay, warmup, no_keepalive, asserts, compare, tolerance, insecure, timeout, report_json, report_csv, report_html, quiet,
+        } => {
+            use rspostman_core::profile;
+            let mut session = load_session(&ws, None, env.as_deref())?;
+            let mut tasks: Vec<profile::BenchTask> = vec![];
+            match &collection {
+                Some(cr) => {
+                    let c = ws.find_collection(cr)?;
+                    session = load_session(&ws, Some(&c), env.as_deref())?;
+                    let all = c.requests();
+                    let list: Vec<(String, &Item)> = match (&request, &folder) {
+                        (Some(r), _) => {
+                            let it = resolve_item(&c, r)?;
+                            let path = all.iter().find(|(_, i)| i.id == it.id).map(|(p, _)| p.clone()).unwrap_or_else(|| it.name.clone());
+                            vec![(path, it)]
+                        }
+                        (None, Some(f)) => {
+                            let it = resolve_item(&c, f)?;
+                            c.requests_in(&it.id)
+                        }
+                        (None, None) => all,
+                    };
+                    if list.is_empty() {
+                        bail!("no requests to benchmark in collection `{}`", c.info.name);
+                    }
+                    for (path, item) in &list {
+                        let Some(r) = &item.request else { continue };
+                        let auth = c.effective_auth(&item.id);
+                        let prepared = rspostman_core::http::prepare(r, auth.as_ref(), &session.scopes)?;
+                        tasks.push(profile::BenchTask { name: path.clone(), prepared });
+                    }
+                }
+                None => {
+                    if target.is_empty() {
+                        bail!("give either a collection (with --request or --folder) or an ad-hoc `[METHOD] URL`");
+                    }
+                    let r = build_request(&target, &req)?;
+                    let prepared = rspostman_core::http::prepare(&r, r.auth.as_ref(), &session.scopes)?;
+                    tasks.push(profile::BenchTask { name: format!("{} {}", prepared.method, rspostman_core::secrets::redact_url(&prepared.url)), prepared });
+                }
+            }
+            use rspostman_core::bench;
+            if concurrency > bench::MAX_CONCURRENCY {
+                eprintln!("{}", out::yellow(&format!("concurrency limited to {}", bench::MAX_CONCURRENCY)));
+            }
+            if insecure {
+                session.settings.verify_ssl = false;
+            }
+            if let Some(t) = timeout {
+                session.settings.timeout_ms = t;
+            }
+            // fail on bad input before any request is sent
+            bench::validate_thresholds(&asserts)?;
+            if let Some(r) = rate {
+                if !(r.is_finite() && r > 0.0) {
+                    bail!("--rate must be a positive number of requests per second");
+                }
+            }
+            let baseline: Option<bench::BenchReport> = match &compare {
+                Some(p) => Some(
+                    serde_json::from_str(&std::fs::read_to_string(p).with_context(|| format!("cannot read baseline {}", p.display()))?)
+                        .with_context(|| format!("{} is not a benchmark JSON report", p.display()))?,
+                ),
+                None => None,
+            };
+            let opts = bench::BenchOptions {
+                iterations,
+                duration_ms: match &duration {
+                    Some(d) => Some(parse_duration_ms(d)?),
+                    None => None,
+                },
+                concurrency,
+                delay_ms: delay,
+                rate,
+                warmup,
+                keep_alive: !no_keepalive,
+                thresholds: asserts,
+            };
+            if !quiet {
+                let names: Vec<&str> = tasks.iter().map(|t| t.name.as_str()).collect();
+                let shape = match opts.duration_ms {
+                    Some(ms) => format!("for {}", rspostman_core::http::human_time(ms)),
+                    None => format!("{iterations} iteration(s)"),
+                };
+                let rate_note = opts.rate.map(|r| format!(" · {r} req/s")).unwrap_or_default();
+                eprintln!("{} {}", out::bold("Benchmark"), out::dim(&format!("{} · {shape} · {} worker(s){rate_note}", names.join(", "), concurrency.clamp(1, bench::MAX_CONCURRENCY))));
+            }
+            // short runs list every request; long ones report progress once a second
+            let list_each = !quiet && opts.duration_ms.is_none() && tasks.len() * iterations <= 60;
+            let count = std::sync::atomic::AtomicUsize::new(0);
+            let failed = std::sync::atomic::AtomicUsize::new(0);
+            let last = std::sync::Mutex::new(std::time::Instant::now());
+            let on_sample = |s: &bench::BenchSample| {
+                let n = count.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+                if s.failed() {
+                    failed.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                }
+                if quiet {
+                    return;
+                }
+                if list_each {
+                    match &s.error {
+                        Some(e) => eprintln!("  {} {}  {}", out::red("✗"), out::bold(&s.name), out::red(e)),
+                        None => eprintln!("  {} {}  {} {}", out::dim(&format!("#{n}")), out::bold(&s.name), out::status(s.status, ""), out::dim(&rspostman_core::http::human_time(s.time_ms))),
+                    }
+                } else if let Ok(mut at) = last.lock() {
+                    if at.elapsed() >= std::time::Duration::from_secs(1) {
+                        *at = std::time::Instant::now();
+                        eprintln!("  {}", out::dim(&format!("{n} requests, {} failed", failed.load(std::sync::atomic::Ordering::SeqCst))));
+                    }
+                }
+            };
+            let report = bench::benchmark(&tasks, &session.settings, &opts, None, &on_sample);
+            let comparison = baseline.as_ref().map(|b| bench::compare(b, &report, tolerance));
+            print_bench_summary(&report, comparison.as_ref());
+            for (path, text) in [
+                (&report_json, serde_json::to_string_pretty(&report)?),
+                (&report_csv, bench::csv(&report)),
+                (&report_html, rspostman_core::bench_report::html(&report, comparison.as_ref())),
+            ] {
+                if let Some(p) = path {
+                    std::fs::write(p, text).with_context(|| format!("cannot write {}", p.display()))?;
+                    eprintln!("report written to {}", p.display());
+                }
+            }
+            let regressed = comparison.as_ref().map(|c| c.regressed).unwrap_or(false);
+            Ok(if report.success() && !regressed { 0 } else { 1 })
+        }
+        Cmd::Profile { target, req, model, prompt, max_tokens, iterations, delay, env, verbose, insecure, timeout, report_json } => {
+            use rspostman_core::profile;
+            let mut request = build_request(&target, &req)?;
+            // the generated chat body implies POST when the method was not given explicitly
+            if target.len() == 1 {
+                request.method = "POST".into();
+            }
+            // an explicit body (--json, -d, …) is kept; otherwise a chat request is generated
+            if request.body.is_none() {
+                let mut body = serde_json::json!({
+                    "model": model,
+                    "messages": [{"role": "user", "content": prompt}],
+                    "stream": true,
+                });
+                if let Some(n) = max_tokens {
+                    body["max_tokens"] = serde_json::json!(n);
+                }
+                request.body = Some(Body::raw(&body.to_string(), "json"));
+            } else if let Some(raw) = request.body.as_ref().and_then(|b| b.raw.clone()) {
+                // make sure an explicit JSON body asks for streaming
+                if let Ok(mut v) = serde_json::from_str::<serde_json::Value>(&raw) {
+                    if let Some(o) = v.as_object_mut() {
+                        o.entry("stream".to_string()).or_insert(serde_json::Value::Bool(true));
+                        request.body = Some(Body::raw(&v.to_string(), "json"));
+                    }
+                }
+            }
+            let mut session = load_session(&ws, None, env.as_deref())?;
+            if insecure {
+                session.settings.verify_ssl = false;
+            }
+            if let Some(t) = timeout {
+                session.settings.timeout_ms = t;
+            }
+            let prepared = rspostman_core::http::prepare(&request, request.auth.as_ref(), &session.scopes)?;
+            eprintln!("{} {}", out::method(&prepared.method), rspostman_core::secrets::redact_url(&prepared.url));
+            let report = profile::profile_llm(&prepared, &session.settings, iterations, delay, None);
+            print_profile_report(&report, verbose);
+            if let Some(p) = &report_json {
+                std::fs::write(p, serde_json::to_string_pretty(&report)?).with_context(|| format!("cannot write {}", p.display()))?;
+                eprintln!("report written to {}", p.display());
+            }
+            Ok(if report.healthy() { 0 } else { 1 })
+        }
         Cmd::Mock { collection, port, host, env, delay, no_cors } => {
             let c = ws.find_collection(&collection)?;
-            let session = Session::load(&ws, Some(&c), env.as_deref())?;
+            let session = load_session(&ws, Some(&c), env.as_deref())?;
             let (srv, routes) = rspostman_core::mock::start(
                 &c,
                 session.scopes,
@@ -1280,7 +2023,7 @@ fn run(cli: Cli) -> Result<i32> {
             use std::io::Write;
             let interval = parse_interval(&every)?;
             let dir = ws.root.join("monitors");
-            std::fs::create_dir_all(&dir)?;
+            rspostman_core::store::create_private_dir(&dir)?;
             let mut failures = 0;
             let mut n = 0;
             loop {
@@ -1310,6 +2053,7 @@ fn run(cli: Cli) -> Result<i32> {
                 let line = serde_json::json!({"started": summary.started, "success": ok, "duration_ms": summary.duration_ms, "stats": summary.stats, "aborted": summary.aborted,
                     "failures": summary.executions.iter().filter(|x| x.exchange.failed()).map(|x| serde_json::json!({"request": x.path, "error": x.exchange.error, "tests": x.exchange.tests.iter().filter(|t| !t.passed).map(|t| &t.name).collect::<Vec<_>>()})).collect::<Vec<_>>()});
                 writeln!(std::fs::OpenOptions::new().create(true).append(true).open(&log)?, "{line}")?;
+                rspostman_core::store::make_private(&log);
                 if count.map(|c| n >= c).unwrap_or(false) {
                     eprintln!("monitor log: {}", log.display());
                     break;
@@ -1319,7 +2063,7 @@ fn run(cli: Cli) -> Result<i32> {
             Ok(if failures > 0 { 1 } else { 0 })
         }
         Cmd::Ws { url, headers, messages, wait, env } => {
-            let session = Session::load(&ws, None, env.as_deref())?;
+            let session = load_session(&ws, None, env.as_deref())?;
             let mut hs = vec![];
             for h in &headers {
                 let (k, v) = kv(h, ':', "header")?;
@@ -1409,6 +2153,7 @@ fn run(cli: Cli) -> Result<i32> {
             srv.join();
             Ok(0)
         }
+        Cmd::Vault(cmd) => vault_cmd(&ws, cmd),
         Cmd::Settings(cmd) => settings_cmd(&ws, cmd),
         Cmd::Echo { port, host } => {
             let srv = rspostman_core::echo::start(&host, port)?;

@@ -14,3 +14,7 @@ Each sprint lives in `Sprints/sprint-N/` and follows the same loop:
 | 2 | Scripting (`pm.*`), collection runner, reporters, mock server, monitors, importers, WebSocket |
 | 3 | GUI: local API server + web UI, Playwright end-to-end tests |
 | 4 | GUI feature completion, Tauri desktop shell, polish, docs |
+| 5 | Review of the profiler / benchmark contribution; credential handling (masking, redaction, prompts, file permissions) |
+| 6 | Local vault: secrets encrypted at rest, `{{vault:name}}` |
+| 7 | Benchmark: duration / rate / warm-up, TTFB, distribution and timeline, thresholds, baseline comparison, CSV / HTML reports, live charts |
+| 8 | User manual with screenshots, in-app Help Center, screenshot generator |

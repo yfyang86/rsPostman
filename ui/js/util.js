@@ -173,6 +173,43 @@ export function tabStrip(tabs, active, onSelect, testid) {
         t.label, t.count ? h("span.count", `(${t.count})`) : null, t.badge ? h("span.count." + t.badge.cls, t.badge.text) : null)));
 }
 
+// ---------------------------------------------------------------- secrets
+
+/** Same rules as `rspostman_core::secrets::is_sensitive_name`: names whose value is a credential. */
+export function isSensitiveName(name) {
+  const n = String(name || "").trim().toLowerCase().replace(/-/g, "_");
+  if (["authorization", "proxy_authorization", "cookie", "set_cookie", "x_api_key", "api_key", "apikey", "sig", "signature", "x_amz_signature", "x_amz_credential", "passwd", "pwd", "pass"].includes(n)) return true;
+  if (/(tokens|token_count|token_type)$/.test(n)) return false;
+  return ["password", "secret", "token", "api_key", "apikey", "access_key", "private_key", "credential", "session_id", "sessionid"].some((p) => n.includes(p));
+}
+
+/** Empty, or nothing but {{variable}} placeholders – such a value is not a secret itself. */
+export const isReference = (value) => /^\s*(\{\{[^{}]*\}\}\s*)*$/.test(value || "");
+
+const EYE = '<svg width="15" height="15" viewBox="0 0 16 16" aria-hidden="true"><path d="M1.2 8S3.8 3.4 8 3.4 14.8 8 14.8 8 12.2 12.6 8 12.6 1.2 8 1.2 8z" fill="none" stroke="currentColor" stroke-width="1.3"/><circle cx="8" cy="8" r="2.1" fill="currentColor"/></svg>';
+
+/**
+ * Text input that is displayed like a password while `masked()` is true, with a button to
+ * reveal it. Returns { el, input, refresh } – call refresh() when the masking condition changes.
+ */
+export function secretInput(attrs, masked) {
+  let revealed = false;
+  const input = h("input", { type: "text", autocomplete: "new-password", spellcheck: "false", "data-1p-ignore": "", "data-lpignore": "true", ...attrs });
+  const toggle = h("button.icon-btn.reveal", { type: "button", html: EYE, onClick: () => { revealed = !revealed; refresh(); input.focus(); } });
+  const refresh = () => {
+    const hide = !!masked();
+    if (!hide) revealed = false;
+    const type = hide && !revealed ? "password" : "text";
+    if (input.type !== type) input.type = type;
+    toggle.classList.toggle("hidden", !hide);
+    toggle.setAttribute("aria-label", revealed ? "Hide value" : "Show value");
+    toggle.setAttribute("aria-pressed", String(revealed));
+    toggle.title = revealed ? "Hide value" : "Show value";
+  };
+  refresh();
+  return { el: h("div.secret", input, toggle), input, refresh };
+}
+
 // ---------------------------------------------------------------- key/value editor
 
 const isBlank = (r) => !r.key && !r.value && !(r.src && String(r.src).length);
@@ -180,7 +217,9 @@ const isBlank = (r) => !r.key && !r.value && !(r.src && String(r.src).length);
 /**
  * Editable key/value table bound to `rows` (mutated in place). A blank row is always kept at
  * the end; use `cleanRows` before saving.
- * opts: { onChange, description, fileType, onUpload, keyLabel, valueLabel, testid, enabledKey }
+ * opts: { onChange, description, fileType, onUpload, keyLabel, valueLabel, testid, enabledKey,
+ *         maskSensitive – hide values whose key looks like a credential (Authorization, token …),
+ *         secretType    – add a "Secret" checkbox per row (stored as type: "secret") }
  */
 export function kvEditor(rows, opts = {}) {
   const enabledOf = (r) => (opts.enabledKey ? r[opts.enabledKey] !== false : !r.disabled);
@@ -202,6 +241,9 @@ export function kvEditor(rows, opts = {}) {
   const rowEl = (r) => {
     const tr = h("tr", { class: enabledOf(r) ? "" : "off" });
     const valueCell = h("td");
+    let refreshMask = () => {};
+    let secretTouched = r.type === "secret"; // the user (or stored data) decided; do not auto-mark
+    const isMasked = () => (opts.secretType && r.type === "secret") || (!!opts.maskSensitive && isSensitiveName(r.key) && !isReference(r.value));
     const drawValue = () => {
       if (opts.fileType && r.type === "file") {
         const path = h("input", { type: "text", placeholder: "File path", value: Array.isArray(r.src) ? r.src[0] || "" : r.src || "", "aria-label": "File path", onInput: (e) => { r.src = e.target.value; changed(); ensureBlank(); } });
@@ -213,17 +255,41 @@ export function kvEditor(rows, opts = {}) {
         } });
         clear(valueCell, h("div.file-cell", path, pick, h("button.btn.small", { type: "button", onClick: () => pick.click() }, "Choose…")));
       } else {
-        clear(valueCell, h("input", { type: "text", placeholder: opts.valueLabel || "Value", value: r.value || "", "aria-label": opts.valueLabel || "Value", onInput: (e) => { r.value = e.target.value; changed(); ensureBlank(); } }));
+        const s = secretInput({ placeholder: opts.valueLabel || "Value", value: r.value || "", "aria-label": opts.valueLabel || "Value", onInput: (e) => { r.value = e.target.value; s.refresh(); changed(); ensureBlank(); } }, isMasked);
+        refreshMask = s.refresh;
+        clear(valueCell, s.el);
       }
     };
     drawValue();
+    const secretBox = opts.secretType
+      ? h("input", { type: "checkbox", checked: r.type === "secret", "aria-label": "Secret", title: "Secret: masked here and in CLI listings", onChange: (e) => {
+          secretTouched = true;
+          if (e.target.checked) r.type = "secret";
+          else delete r.type;
+          refreshMask();
+          changed();
+        } })
+      : null;
     append(tr, [
       h("td.c", h("input", { type: "checkbox", checked: enabledOf(r), "aria-label": "Enabled", onChange: (e) => { setEnabled(r, e.target.checked); tr.className = e.target.checked ? "" : "off"; changed(); } })),
-      h("td", h("input", { type: "text", placeholder: opts.keyLabel || "Key", value: r.key || "", "aria-label": opts.keyLabel || "Key", onInput: (e) => { r.key = e.target.value; changed(); ensureBlank(); } })),
+      h("td", h("input", { type: "text", placeholder: opts.keyLabel || "Key", value: r.key || "", "aria-label": opts.keyLabel || "Key", onInput: (e) => {
+        r.key = e.target.value;
+        // a variable named like a credential starts out as secret; the checkbox can undo it
+        if (secretBox && !secretTouched) {
+          const auto = isSensitiveName(r.key);
+          if (auto) r.type = "secret";
+          else delete r.type;
+          secretBox.checked = auto;
+        }
+        refreshMask();
+        changed();
+        ensureBlank();
+      } })),
       opts.fileType ? h("td.t", h("select", { "aria-label": "Type", onChange: (e) => { r.type = e.target.value; if (r.type === "file") r.value = ""; else delete r.src; drawValue(); changed(); } },
         h("option", { value: "text", selected: r.type !== "file" }, "Text"), h("option", { value: "file", selected: r.type === "file" }, "File"))) : null,
       valueCell,
       opts.description ? h("td", h("input", { type: "text", placeholder: "Description", value: r.description || "", "aria-label": "Description", onInput: (e) => { r.description = e.target.value || undefined; changed(); } })) : null,
+      secretBox ? h("td.s", secretBox) : null,
       h("td.x", h("button.icon-btn", { type: "button", title: "Remove row", "aria-label": "Remove row", onClick: () => {
         const i = rows.indexOf(r);
         if (i !== -1) rows.splice(i, 1);
@@ -236,7 +302,7 @@ export function kvEditor(rows, opts = {}) {
   for (const r of rows) tbody.append(rowEl(r));
   ensureBlank();
   return h("table.kv", { testid: opts.testid },
-    h("thead", h("tr", h("th.c"), h("th", opts.keyLabel || "Key"), opts.fileType ? h("th.t", "Type") : null, h("th", opts.valueLabel || "Value"), opts.description ? h("th", "Description") : null, h("th.x"))),
+    h("thead", h("tr", h("th.c"), h("th", opts.keyLabel || "Key"), opts.fileType ? h("th.t", "Type") : null, h("th", opts.valueLabel || "Value"), opts.description ? h("th", "Description") : null, opts.secretType ? h("th.s", "Secret") : null, h("th.x"))),
     tbody);
 }
 

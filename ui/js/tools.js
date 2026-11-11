@@ -1,5 +1,6 @@
 // Toolbar tools: import, code snippets, collection runner, mock servers, WebSocket client,
 // cookie manager and settings.
+import { helpButton } from "./help.js";
 import { api } from "./api.js";
 import { state, tools, views, collectionActions, requestActions, emit, openTab, requestTab, collectionById, openSingleton, refreshData } from "./state.js";
 import { h, clear, toast, guard, modal, kvEditor, cleanRows, confirmDialog, copyText, humanSize, humanTime, methodClass, statusClass, download } from "./util.js";
@@ -72,7 +73,7 @@ function codeDialog(tab, getRequest) {
     title: "Code snippet",
     wide: true,
     testid: "codegen-dialog",
-    body: [h("div.field-row", h("label.muted", "Language"), select, h("span.muted", "Variables and authorization are resolved with the active environment.")), out],
+    body: [h("div.field-row", h("label.muted", "Language"), select, h("span.muted", "Variables and authorization are resolved with the active environment – the snippet contains the real credentials.")), out],
     buttons: [{ label: "Copy", action: () => { copyText(out.textContent); return false; } }, { label: "Close", primary: true }],
   });
 }
@@ -218,7 +219,7 @@ views.runner = (tab) => {
   tab.onClose = () => { if (timer) clearInterval(timer); };
   drawForm();
   drawResults();
-  return h("div.page", { testid: "runner" }, h("h2", "Collection runner"), h("div.sub", "Run every request of a collection or folder in order, with scripts, tests and optional iteration data."), form, results);
+  return h("div.page", { testid: "runner" }, h("h2", "Collection runner", helpButton("collection-runner")), h("div.sub", "Run every request of a collection or folder in order, with scripts, tests and optional iteration data."), form, results);
 };
 
 // ---------------------------------------------------------------- mock servers
@@ -267,7 +268,7 @@ views.mock = (tab) => {
   tab.onShow = () => { drawForm(); refresh(); if (!timer) timer = setInterval(refresh, 1500); };
   tab.onClose = () => { if (timer) clearInterval(timer); };
   drawForm();
-  return h("div.page", { testid: "mocks" }, h("h2", "Mock servers"), h("div.sub", "Simulate an API from the examples saved in a collection."), form, list);
+  return h("div.page", { testid: "mocks" }, h("h2", "Mock servers", helpButton("mock-servers")), h("div.sub", "Simulate an API from the examples saved in a collection."), form, list);
 };
 
 // ---------------------------------------------------------------- WebSocket client
@@ -343,9 +344,9 @@ views.ws = (tab) => {
   tab.onClose = () => { if (timer) clearInterval(timer); if (conn) api.del("/ws/" + conn.id).catch(() => {}); };
   drawBar();
   drawLog();
-  return h("div.page", { testid: "ws" }, h("h2", "WebSocket"), h("div.sub", "Connect to a ws:// or wss:// endpoint, send messages and watch the replies."),
+  return h("div.page", { testid: "ws" }, h("h2", "WebSocket", helpButton("websocket")), h("div.sub", "Connect to a ws:// or wss:// endpoint, send messages and watch the replies."),
     bar,
-    h("details", { style: "margin-bottom:10px" }, h("summary.muted", { style: "cursor:pointer" }, "Handshake headers"), kvEditor(cfg.headers, { testid: "ws-headers" })),
+    h("details", { style: "margin-bottom:10px" }, h("summary.muted", { style: "cursor:pointer" }, "Handshake headers"), kvEditor(cfg.headers, { testid: "ws-headers", maskSensitive: true })),
     log, h("div", { style: "height:10px" }), composer);
 };
 
@@ -368,7 +369,7 @@ views.cookies = (tab) => {
       : h("div.placeholder", "The cookie jar is empty.", h("br"), "Cookies set by responses are stored here and sent with matching requests."));
   };
   tab.onShow = refresh;
-  return h("div.page", { testid: "cookies" }, h("h2", "Cookies"), h("div.sub", "Cookies are stored in the workspace and shared by the GUI and the CLI."),
+  return h("div.page", { testid: "cookies" }, h("h2", "Cookies", helpButton("cookies")), h("div.sub", "Cookies are stored in the workspace and shared by the GUI and the CLI."),
     h("div.card", h("div.field-row", { style: "margin:0" }, urlInput, cookieInput,
       h("button.btn.primary", { testid: "cookie-add", onClick: () => guard(async () => {
         if (!urlInput.value.trim() || !cookieInput.value.trim()) return toast("Enter a URL and a cookie such as name=value", "error");
@@ -401,6 +402,7 @@ views.settings = (tab) => {
     ["cookies", "Store and send cookies", "bool"],
     ["history_limit", "History entries to keep", "number"],
     ["history_body_limit", "Max response bytes stored per history entry", "number"],
+    ["history_store_secrets", "Keep passwords, tokens and keys in the history (otherwise stored as <redacted>)", "bool"],
   ];
   const draw = () => clear(body, h("div.form-grid", { style: "grid-template-columns: 300px minmax(0, 460px)" }, FIELDS.flatMap(([key, label, kind, hint]) => {
     const id = "set-" + key;
@@ -415,7 +417,7 @@ views.settings = (tab) => {
     toast("Settings saved", "ok");
   });
   draw();
-  return h("div.page", { testid: "settings" }, h("h2", "Settings"), h("div.sub", `Stored in ${state.workspace}/settings.json and shared with the CLI.`),
+  return h("div.page", { testid: "settings" }, h("h2", "Settings", helpButton("settings")), h("div.sub", `Stored in ${state.workspace}/settings.json and shared with the CLI.`),
     h("div.card", body),
     h("div.page-actions", h("button.btn.primary", { testid: "settings-save", onClick: () => tab.save() }, "Save"),
       h("button.btn", { testid: "settings-reset", onClick: async () => {

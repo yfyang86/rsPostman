@@ -1,6 +1,6 @@
 // Authorization editor shared by requests, folders and collections.
 import { api } from "./api.js";
-import { h, clear, guard, toast } from "./util.js";
+import { h, clear, guard, toast, secretInput, isReference } from "./util.js";
 import { authParams, makeAuth } from "./model.js";
 
 const TYPES = [
@@ -57,6 +57,9 @@ const OAUTH2_GRANT = [
 const HINTS = {
   inherit: "This item uses the authorization of its parent folder or collection.",
   noauth: "No authorization is sent with the request.",
+  basic: "Tip: keep the password in the vault and reference it as {{vault:name}} – it is then encrypted on disk and the collection file contains no secret.",
+  bearer: "Tip: keep the token in the vault and reference it as {{vault:name}} – it is then encrypted on disk and the collection file contains no secret.",
+  apikey: "Tip: keep the key in the vault and reference it as {{vault:name}} – it is then encrypted on disk and the collection file contains no secret.",
   digest: "The request is retried automatically after the server's 401 challenge.",
   awsv4: "The request is signed with AWS Signature Version 4 when it is sent.",
   oauth1: "The OAuth 1.0a signature is generated when the request is sent.",
@@ -84,8 +87,13 @@ export function authEditor(holder, opts = {}) {
     } else if (kind === "textarea") {
       input = h("textarea", { id, testid: id, placeholder: extra || "", spellcheck: "false", onInput: (e) => { params[key] = e.target.value; commit(); } });
       input.value = params[key] || "";
+    } else if (kind === "secret") {
+      // shown as dots unless it is only a {{variable}} reference; the eye button reveals it
+      const s = secretInput({ id, testid: id, placeholder: extra || "value or {{variable}}", value: params[key] || "",
+        onInput: (e) => { params[key] = e.target.value; s.refresh(); commit(); } }, () => !isReference(params[key]));
+      input = s.el;
     } else {
-      input = h("input", { id, testid: id, type: "text", autocomplete: "off", spellcheck: "false", placeholder: extra || (kind === "secret" ? "value or {{variable}}" : ""), value: params[key] || "",
+      input = h("input", { id, testid: id, type: "text", autocomplete: "off", spellcheck: "false", placeholder: extra || "", value: params[key] || "",
         onInput: (e) => { params[key] = e.target.value; commit(); } });
     }
     return [h("label", { for: id }, label), input];

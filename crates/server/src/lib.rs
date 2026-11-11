@@ -11,6 +11,7 @@ use rspostman_core::engine::{self, Exchange, Session};
 use rspostman_core::import::Imported;
 use rspostman_core::mock::{MockOptions, MockRoute};
 use rspostman_core::model::{Auth, Collection, Environment, Request};
+use rspostman_core::profile::{self, BenchReport, ProfileReport};
 use rspostman_core::runner::{self, RunEvent, RunOptions, RunSummary};
 use rspostman_core::server::{serve, Req, Resp, ServerHandle};
 use rspostman_core::ws::WsClient;
@@ -22,6 +23,10 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 static UI: Dir = include_dir!("$CARGO_MANIFEST_DIR/../../ui");
+
+/// The Help Center shows the same documents that are in the repository's `docs/` folder.
+const USER_MANUAL: &str = include_str!("../../../docs/user-manual.md");
+const SCRIPTING_REFERENCE: &str = include_str!("../../../docs/SCRIPTING.md");
 
 struct MockEntry {
     handle: ServerHandle,
@@ -42,12 +47,42 @@ struct RunEntry {
     cancel: Arc<AtomicBool>,
 }
 
+#[derive(Default)]
+struct ProfileEntry {
+    done: bool,
+    runs_total: usize,
+    runs_done: usize,
+    report: Option<ProfileReport>,
+    error: Option<String>,
+    cancel: Arc<AtomicBool>,
+}
+
+#[derive(Default)]
+struct BenchEntry {
+    done: bool,
+    /// Planned number of requests (0 for a duration-based run).
+    total: usize,
+    names: Vec<String>,
+    opts: rspostman_core::bench::BenchOptions,
+    started: Option<std::time::Instant>,
+    /// Samples so far, for interim results while the run is in progress.
+    live: Vec<rspostman_core::bench::BenchSample>,
+    report: Option<BenchReport>,
+    comparison: Option<rspostman_core::bench::Comparison>,
+    error: Option<String>,
+    cancel: Arc<AtomicBool>,
+}
+
 pub struct App {
     ws: Workspace,
     port: std::sync::atomic::AtomicU16,
     sockets: Mutex<HashMap<String, WsClient>>,
     mocks: Mutex<HashMap<String, MockEntry>>,
     runs: Mutex<HashMap<String, Arc<Mutex<RunEntry>>>>,
+    profiles: Mutex<HashMap<String, Arc<Mutex<ProfileEntry>>>>,
+    benchmarks: Mutex<HashMap<String, Arc<Mutex<BenchEntry>>>>,
+    /// The unlocked vault (key in memory) – `None` while locked. Dropped on lock and on exit.
+    vault: Mutex<Option<rspostman_core::vault::Vault>>,
 }
 
 fn mime(path: &str) -> &'static str {
@@ -92,7 +127,7 @@ fn execution_summary(x: &runner::Execution) -> Value {
         "item_id": ex.item_id,
         "name": ex.name,
         "method": ex.request.as_ref().map(|p| p.method.clone()),
-        "url": ex.request.as_ref().map(|p| p.url.clone()),
+        "url": ex.request.as_ref().map(|p| rspostman_core::secrets::redact_url(&p.url)),
         "status": ex.response.as_ref().map(|r| r.status),
         "status_text": ex.response.as_ref().map(|r| r.status_text.clone()),
         "time_ms": ex.response.as_ref().map(|r| r.time_ms),
@@ -131,7 +166,7 @@ fn yes() -> bool {
 
 impl App {
     pub fn new(ws: Workspace) -> Arc<App> {
-        Arc::new(App { ws, port: Default::default(), sockets: Default::default(), mocks: Default::default(), runs: Default::default() })
+        Arc::new(App { ws, port: Default::default(), sockets: Default::default(), mocks: Default::default(), runs: Default::default(), profiles: Default::default(), benchmarks: Default::default(), vault: Default::default() })
     }
 
     fn collection(&self, id: &str) -> Result<Collection> {
@@ -139,23 +174,37 @@ impl App {
     }
 
     fn session(&self, collection: Option<&Collection>, environment_id: &Option<String>) -> Result<Session> {
-        match environment_id.as_deref() {
+        let mut s = match environment_id.as_deref() {
             // an explicit empty id means "no environment"
             Some("") => {
                 let mut s = Session::load(&self.ws, collection, None)?;
                 s.environment = None;
                 s.scopes.environment.clear();
-                Ok(s)
+                s
             }
-            Some(id) => Session::load(&self.ws, collection, Some(id)),
-            None => Session::load(&self.ws, collection, None),
+            Some(id) => Session::load(&self.ws, collection, Some(id))?,
+            None => Session::load(&self.ws, collection, None)?,
+        };
+        if let Some(v) = self.vault.lock().map_err(|_| anyhow!("lock poisoned"))?.as_ref() {
+            s.unlock_vault(v)?;
         }
+        Ok(s)
+    }
+
+    fn vault_status(&self) -> Result<Value> {
+        let unlocked = self.vault.lock().map_err(|_| anyhow!("lock poisoned"))?.is_some();
+        Ok(json!({
+            "exists": rspostman_core::vault::exists(&self.ws),
+            "unlocked": unlocked,
+            "names": rspostman_core::vault::names(&self.ws)?,
+        }))
     }
 
     fn bootstrap(&self) -> Result<Value> {
         Ok(json!({
             "version": env!("CARGO_PKG_VERSION"),
             "workspace": self.ws.root.display().to_string(),
+            "vault": self.vault_status()?,
             "collections": self.ws.collections()?,
             "environments": self.ws.environments()?,
             "globals": self.ws.globals()?,
@@ -218,7 +267,7 @@ impl App {
             let mut source = b.request.clone();
             // keep request-level scripts replayable from the history
             let _ = &mut source;
-            engine::record(&self.ws, &session.settings, &ex, Some(&source), b.collection_id.as_deref())?;
+            engine::record(&self.ws, &session, &ex, Some(&source), b.collection_id.as_deref())?;
         }
         let mut v = exchange_json(&ex);
         v["scripts"] = json!({"prerequest": b.prerequest, "test": b.test});
@@ -289,6 +338,173 @@ impl App {
                 "stats": s.stats, "duration_ms": s.duration_ms, "aborted": s.aborted, "success": s.success(),
                 "collection_name": s.collection_name, "environment": s.environment, "started": s.started,
             })),
+        }))
+    }
+
+    fn start_profile(self: &Arc<Self>, body: Value) -> Result<Value> {
+        let mut request: Request = serde_json::from_value(body["request"].clone()).context("400:invalid request")?;
+        // Generated OpenAI-compatible chat body unless the request already carries one.
+        let has_body = request.body.as_ref().map(|b| b.mode == "raw" && b.raw.as_deref().map(|r| !r.trim().is_empty()).unwrap_or(false)).unwrap_or(false);
+        if !has_body {
+            let mut chat = json!({
+                "model": body["model"].as_str().filter(|s| !s.is_empty()).unwrap_or("gpt-4o-mini"),
+                "messages": [{"role": "user", "content": body["prompt"].as_str().unwrap_or("Say hello in a few words.")}],
+                "stream": true,
+            });
+            if let Some(n) = body["max_tokens"].as_u64().filter(|n| *n > 0) {
+                chat["max_tokens"] = json!(n);
+            }
+            request.method = "POST".into();
+            request.body = Some(rspostman_core::model::Body::raw(&chat.to_string(), "json"));
+        }
+        let iterations = body["iterations"].as_u64().filter(|n| *n > 0).unwrap_or(3) as usize;
+        let delay_ms = body["delay_ms"].as_u64().unwrap_or(0);
+        let collection = match body["collection_id"].as_str() {
+            Some(id) if !id.is_empty() => self.ws.collection(id)?,
+            _ => None,
+        };
+        let env = body.get("environment_id").and_then(|e| e.as_str()).map(|s| s.to_string());
+        let session = self.session(collection.as_ref(), &env)?;
+        let auth = request.auth.clone().or_else(|| collection.and_then(|c| c.auth.clone()));
+        let prepared = rspostman_core::http::prepare(&request, auth.as_ref(), &session.scopes).map_err(|e| anyhow!("400:{e}"))?;
+        let settings = session.settings;
+        let id = rspostman_core::model::new_id();
+        let entry = Arc::new(Mutex::new(ProfileEntry { runs_total: iterations, ..Default::default() }));
+        let cancel = entry.lock().map(|e| e.cancel.clone()).map_err(|_| anyhow!("lock poisoned"))?;
+        self.profiles.lock().map_err(|_| anyhow!("lock poisoned"))?.insert(id.clone(), entry.clone());
+        std::thread::spawn(move || {
+            let report = profile::profile_llm(&prepared, &settings, iterations, delay_ms, Some(&cancel));
+            let runs_done = report.samples.len();
+            if let Ok(mut e) = entry.lock() {
+                e.runs_done = runs_done;
+                e.report = Some(report);
+                e.done = true;
+            }
+        });
+        Ok(json!({ "id": id }))
+    }
+
+    fn profile_status(&self, id: &str) -> Result<Value> {
+        let entry = self.profiles.lock().map_err(|_| anyhow!("lock poisoned"))?.get(id).cloned().ok_or_else(|| not_found("profile"))?;
+        let e = entry.lock().map_err(|_| anyhow!("lock poisoned"))?;
+        Ok(json!({
+            "id": id,
+            "done": e.done,
+            "runs_total": e.runs_total,
+            "runs_done": e.runs_done,
+            "report": e.report,
+            "error": e.error,
+        }))
+    }
+
+    fn start_benchmark(self: &Arc<Self>, body: Value) -> Result<Value> {
+        use rspostman_core::bench;
+        let opts = bench::BenchOptions {
+            iterations: body["iterations"].as_u64().filter(|n| *n > 0).unwrap_or(10) as usize,
+            duration_ms: body["duration_ms"].as_u64().filter(|n| *n > 0),
+            concurrency: (body["concurrency"].as_u64().filter(|n| *n > 0).unwrap_or(1) as usize).min(bench::MAX_CONCURRENCY),
+            delay_ms: body["delay_ms"].as_u64().unwrap_or(0),
+            rate: body["rate"].as_f64().filter(|r| r.is_finite() && *r > 0.0),
+            warmup: body["warmup"].as_u64().unwrap_or(0).min(1000) as usize,
+            keep_alive: body["keep_alive"].as_bool().unwrap_or(true),
+            thresholds: body["thresholds"].as_array().map(|a| a.iter().filter_map(|t| t.as_str()).map(|t| t.trim().to_string()).filter(|t| !t.is_empty()).collect()).unwrap_or_default(),
+        };
+        bench::validate_thresholds(&opts.thresholds).map_err(|e| anyhow!("400:{e}"))?;
+        let env = body.get("environment_id").and_then(|e| e.as_str()).map(|s| s.to_string());
+        let mut tasks: Vec<profile::BenchTask> = vec![];
+        let adhoc: Option<Request> = serde_json::from_value(body["request"].clone()).ok();
+        match (body["collection_id"].as_str().filter(|s| !s.is_empty()), adhoc) {
+            (Some(cid), _) => {
+                let c = self.collection(cid)?;
+                let session = self.session(Some(&c), &env)?;
+                let all = c.requests();
+                let list: Vec<(String, &rspostman_core::model::Item)> = match (body["request_id"].as_str().filter(|s| !s.is_empty()), body["folder_id"].as_str().filter(|s| !s.is_empty())) {
+                    (Some(rid), _) => {
+                        let it = c.find(rid).ok_or_else(|| anyhow!("404:request `{rid}` not found"))?;
+                        let path = all.iter().find(|(_, i)| i.id == it.id).map(|(p, _)| p.clone()).unwrap_or_else(|| it.name.clone());
+                        vec![(path, it)]
+                    }
+                    (None, Some(fid)) => c.requests_in(fid),
+                    (None, None) => all,
+                };
+                if list.is_empty() {
+                    bail!("400:collection has no requests to benchmark");
+                }
+                for (path, item) in &list {
+                    let Some(r) = &item.request else { continue };
+                    let auth = c.effective_auth(&item.id);
+                    let prepared = rspostman_core::http::prepare(r, auth.as_ref(), &session.scopes).map_err(|e| anyhow!("400:{e}"))?;
+                    tasks.push(profile::BenchTask { name: path.clone(), prepared });
+                }
+            }
+            (None, Some(request)) => {
+                let session = self.session(None, &env)?;
+                let prepared = rspostman_core::http::prepare(&request, request.auth.as_ref(), &session.scopes).map_err(|e| anyhow!("400:{e}"))?;
+                tasks.push(profile::BenchTask { name: format!("{} {}", prepared.method, rspostman_core::secrets::redact_url(&prepared.url)), prepared });
+            }
+            (None, None) => bail!("400:give a collection_id or a request"),
+        }
+        let settings = self.session(None, &env)?.settings;
+        let total = if opts.duration_ms.is_some() { 0 } else { tasks.len() * opts.iterations };
+        let id = rspostman_core::model::new_id();
+        let entry = Arc::new(Mutex::new(BenchEntry { total, names: tasks.iter().map(|t| t.name.clone()).collect(), opts: opts.clone(), ..Default::default() }));
+        let cancel = entry.lock().map(|e| e.cancel.clone()).map_err(|_| anyhow!("lock poisoned"))?;
+        self.benchmarks.lock().map_err(|_| anyhow!("lock poisoned"))?.insert(id.clone(), entry.clone());
+        let duration_ms = opts.duration_ms;
+        std::thread::spawn(move || {
+            // live samples for the UI's interim results
+            let progress = entry.clone();
+            let on_sample = move |sample: &bench::BenchSample| {
+                if let Ok(mut e) = progress.lock() {
+                    if e.started.is_none() {
+                        e.started = Some(std::time::Instant::now() - std::time::Duration::from_millis(sample.started_ms + sample.time_ms));
+                    }
+                    e.live.push(sample.clone());
+                }
+            };
+            let report = bench::benchmark(&tasks, &settings, &opts, Some(&cancel), &on_sample);
+            if let Ok(mut e) = entry.lock() {
+                e.live = vec![];
+                e.report = Some(report);
+                e.done = true;
+            }
+        });
+        Ok(json!({ "id": id, "total": total, "duration_ms": duration_ms }))
+    }
+
+    fn benchmark_status(&self, id: &str) -> Result<Value> {
+        use rspostman_core::bench;
+        let entry = self.benchmarks.lock().map_err(|_| anyhow!("lock poisoned"))?.get(id).cloned().ok_or_else(|| not_found("benchmark"))?;
+        let e = entry.lock().map_err(|_| anyhow!("lock poisoned"))?;
+        // What the UI needs: the statistics, plus only the failed samples (not every sample).
+        let slim = |r: &BenchReport| {
+            let mut r = r.clone();
+            r.samples.retain(|s| s.error.is_some());
+            r.samples.truncate(50);
+            r
+        };
+        let (report, done_count) = match &e.report {
+            Some(r) => (Some(slim(r)), r.total_requests),
+            None if e.live.is_empty() => (None, 0),
+            None => {
+                // interim: computed from the samples so far (the most recent 300k on very long runs)
+                let from = e.live.len().saturating_sub(300_000);
+                let elapsed = e.started.map(|s| s.elapsed().as_millis() as u64).unwrap_or(0);
+                // thresholds are judged on the finished run only
+                let opts = bench::BenchOptions { thresholds: vec![], ..e.opts.clone() };
+                (Some(slim(&bench::summarize(&e.names, e.live[from..].to_vec(), &opts, None, elapsed, 0, None))), e.live.len())
+            }
+        };
+        Ok(json!({
+            "id": id,
+            "done": e.done,
+            "total": e.total,
+            "duration_ms": e.opts.duration_ms,
+            "elapsed_ms": e.started.map(|s| s.elapsed().as_millis() as u64).unwrap_or(0),
+            "done_count": done_count,
+            "report": report,
+            "comparison": e.comparison,
+            "error": e.error,
         }))
     }
 
@@ -463,7 +679,8 @@ impl App {
                     None => None,
                 };
                 let env = body.get("environment_id").and_then(|e| e.as_str()).map(|s| s.to_string());
-                let session = self.session(collection.as_ref(), &env)?;
+                let mut session = self.session(collection.as_ref(), &env)?;
+                session.scopes.vault.clear(); // a preview must not reveal vault secrets
                 let text = body["text"].as_str().unwrap_or("");
                 ok(json!({"resolved": session.scopes.resolve(text), "unresolved": session.scopes.unresolved(text)}))
             }
@@ -483,9 +700,9 @@ impl App {
                 // body: raw file bytes; ?name=file.ext -> stored under <workspace>/uploads
                 let name: String = req.param("name").unwrap_or("upload.bin").chars().map(|ch| if ch.is_ascii_alphanumeric() || ch == '.' || ch == '-' || ch == '_' { ch } else { '_' }).collect();
                 let dir = self.ws.root.join("uploads");
-                std::fs::create_dir_all(&dir)?;
+                rspostman_core::store::create_private_dir(&dir)?;
                 let path = dir.join(format!("{}-{name}", &rspostman_core::model::new_id()[..8]));
-                std::fs::write(&path, &req.body)?;
+                rspostman_core::store::write_private(&path, &req.body)?;
                 ok(json!({"path": path.display().to_string(), "size": req.body.len()}))
             }
 
@@ -519,6 +736,52 @@ impl App {
             ("DELETE", ["history"]) => {
                 self.ws.clear_history()?;
                 ok(json!({"deleted": true}))
+            }
+
+            // ---------------------------------------------------------- vault
+            // Secret values only ever travel browser -> server; no endpoint returns one.
+            ("GET", ["vault"]) => ok(self.vault_status()?),
+            ("POST", ["vault", "create"]) => {
+                let body: Value = req.json()?;
+                let v = rspostman_core::vault::Vault::create(&self.ws, body["passphrase"].as_str().unwrap_or("")).map_err(|e| anyhow!("400:{e}"))?;
+                *self.vault.lock().map_err(|_| lock_err())? = Some(v);
+                ok(self.vault_status()?)
+            }
+            ("POST", ["vault", "unlock"]) => {
+                let body: Value = req.json()?;
+                let v = rspostman_core::vault::Vault::unlock(&self.ws, body["passphrase"].as_str().unwrap_or("")).map_err(|e| anyhow!("400:{e}"))?;
+                *self.vault.lock().map_err(|_| lock_err())? = Some(v);
+                ok(self.vault_status()?)
+            }
+            ("POST", ["vault", "lock"]) => {
+                *self.vault.lock().map_err(|_| lock_err())? = None;
+                ok(self.vault_status()?)
+            }
+            ("POST", ["vault", "passphrase"]) => {
+                let body: Value = req.json()?;
+                // the current passphrase is checked again even when the vault is unlocked
+                let mut v = rspostman_core::vault::Vault::unlock(&self.ws, body["current"].as_str().unwrap_or("")).map_err(|e| anyhow!("400:{e}"))?;
+                v.change_passphrase(body["new"].as_str().unwrap_or("")).map_err(|e| anyhow!("400:{e}"))?;
+                *self.vault.lock().map_err(|_| lock_err())? = Some(v);
+                ok(self.vault_status()?)
+            }
+            ("PUT", ["vault", "secrets", name]) => {
+                let body: Value = req.json()?;
+                let value = body["value"].as_str().ok_or_else(|| anyhow!("400:value is required"))?;
+                let mut guard = self.vault.lock().map_err(|_| lock_err())?;
+                let v = guard.as_mut().ok_or_else(|| anyhow!("400:the vault is locked"))?;
+                v.set(name, value).map_err(|e| anyhow!("400:{e}"))?;
+                drop(guard);
+                ok(self.vault_status()?)
+            }
+            ("DELETE", ["vault", "secrets", name]) => {
+                let mut guard = self.vault.lock().map_err(|_| lock_err())?;
+                let v = guard.as_mut().ok_or_else(|| anyhow!("400:the vault is locked"))?;
+                if !v.remove(name)? {
+                    return Err(not_found("secret"));
+                }
+                drop(guard);
+                ok(self.vault_status()?)
             }
 
             // ---------------------------------------------------------- cookies
@@ -568,6 +831,46 @@ impl App {
                 })
             }
 
+            // ---------------------------------------------------------- profile & benchmark
+            ("POST", ["profile"]) => ok(self.start_profile(req.json()?).map_err(|e| anyhow!("400:{e:#}"))?),
+            ("GET", ["profile", id]) => ok(self.profile_status(id)?),
+            ("POST", ["profile", id, "cancel"]) => {
+                let entry = self.profiles.lock().map_err(|_| lock_err())?.get(*id).cloned().ok_or_else(|| not_found("profile"))?;
+                entry.lock().map_err(|_| lock_err())?.cancel.store(true, Ordering::SeqCst);
+                ok(json!({"cancelled": true}))
+            }
+            ("POST", ["benchmark"]) => ok(self.start_benchmark(req.json()?).map_err(|e| anyhow!("400:{e:#}"))?),
+            ("GET", ["benchmark", id]) => ok(self.benchmark_status(id)?),
+            ("POST", ["benchmark", id, "cancel"]) => {
+                let entry = self.benchmarks.lock().map_err(|_| lock_err())?.get(*id).cloned().ok_or_else(|| not_found("benchmark"))?;
+                entry.lock().map_err(|_| lock_err())?.cancel.store(true, Ordering::SeqCst);
+                ok(json!({"cancelled": true}))
+            }
+            ("POST", ["benchmark", id, "compare"]) => {
+                // body: { baseline: <JSON report of an earlier run>, tolerance: percent }
+                let body: Value = req.json()?;
+                let baseline: BenchReport = serde_json::from_value(body["baseline"].clone()).map_err(|_| anyhow!("400:the baseline is not a benchmark JSON report"))?;
+                if baseline.total_requests == 0 {
+                    bail!("400:the baseline is not a benchmark JSON report (it contains no requests)");
+                }
+                let entry = self.benchmarks.lock().map_err(|_| lock_err())?.get(*id).cloned().ok_or_else(|| not_found("benchmark"))?;
+                let mut e = entry.lock().map_err(|_| lock_err())?;
+                let current = e.report.as_ref().ok_or_else(|| anyhow!("400:the benchmark has not finished"))?;
+                let c = rspostman_core::bench::compare(&baseline, current, body["tolerance"].as_f64().unwrap_or(10.0));
+                e.comparison = Some(c.clone());
+                ok(json!(c))
+            }
+            ("GET", ["benchmark", id, "report"]) => {
+                let entry = self.benchmarks.lock().map_err(|_| lock_err())?.get(*id).cloned().ok_or_else(|| not_found("benchmark"))?;
+                let e = entry.lock().map_err(|_| lock_err())?;
+                let r = e.report.as_ref().ok_or_else(|| anyhow!("400:the benchmark has not finished"))?;
+                Ok(match req.param("format") {
+                    Some("csv") => Resp::new(200, "text/csv; charset=utf-8", rspostman_core::bench::csv(r)).with("Content-Disposition", "attachment; filename=\"benchmark.csv\""),
+                    Some("json") => Resp::new(200, "application/json", serde_json::to_string_pretty(r)?).with("Content-Disposition", "attachment; filename=\"benchmark.json\""),
+                    _ => Resp::new(200, "text/html; charset=utf-8", rspostman_core::bench_report::html(r, e.comparison.as_ref())),
+                })
+            }
+
             // ---------------------------------------------------------- mock servers
             ("GET", ["mocks"]) => {
                 let mocks = self.mocks.lock().map_err(|_| lock_err())?;
@@ -579,7 +882,8 @@ impl App {
                 let body: Value = req.json()?;
                 let c = self.collection(body["collection_id"].as_str().unwrap_or(""))?;
                 let env = body.get("environment_id").and_then(|e| e.as_str()).map(|s| s.to_string());
-                let session = self.session(Some(&c), &env)?;
+                let mut session = self.session(Some(&c), &env)?;
+                session.scopes.vault.clear(); // mock responses must not serve vault secrets
                 let log = Arc::new(Mutex::new(Vec::<String>::new()));
                 let sink = log.clone();
                 let (handle, routes) = rspostman_core::mock::start(
@@ -703,6 +1007,11 @@ impl App {
         if rel.contains("..") {
             return Resp::text(400, "bad path");
         }
+        match rel {
+            "help/user-manual.md" => return Resp::new(200, "text/markdown; charset=utf-8", USER_MANUAL).with("Cache-Control", "no-cache"),
+            "help/scripting.md" => return Resp::new(200, "text/markdown; charset=utf-8", SCRIPTING_REFERENCE).with("Cache-Control", "no-cache"),
+            _ => {}
+        }
         // Development aid: serve the UI from disk when RSPOSTMAN_UI_DIR is set.
         if let Some(dir) = std::env::var_os("RSPOSTMAN_UI_DIR") {
             return match std::fs::read(std::path::Path::new(&dir).join(rel)) {
@@ -736,4 +1045,71 @@ pub fn start(ws: Workspace, port: u16) -> Result<ServerHandle> {
     let handle = serve("127.0.0.1", port, 16, move |req| handler_app.handle(req))?;
     app.port.store(handle.port, Ordering::SeqCst);
     Ok(handle)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// GitHub-style heading anchor, the same rule the Help Center uses (`ui/js/md.js`).
+    fn slug(heading: &str) -> String {
+        let cleaned: String = heading.to_lowercase().chars().filter(|c| c.is_alphanumeric() || c.is_whitespace() || *c == '-').collect();
+        cleaned.split_whitespace().collect::<Vec<_>>().join("-")
+    }
+
+    fn targets(doc: &str, prefix: &str) -> Vec<String> {
+        let mut out = vec![];
+        let mut rest = doc;
+        while let Some(i) = rest.find("](") {
+            let after = &rest[i + 2..];
+            let end = after.find(')').unwrap_or(after.len());
+            if after[..end].starts_with(prefix) {
+                out.push(after[..end].to_string());
+            }
+            rest = &after[end..];
+        }
+        out
+    }
+
+    #[test]
+    fn manual_images_and_links_resolve() {
+        // every screenshot the manual shows is shipped with the UI …
+        let images = targets(USER_MANUAL, "../ui/help/img/");
+        assert!(images.len() >= 20, "the manual should be illustrated, found {} images", images.len());
+        for img in &images {
+            let rel = img.trim_start_matches("../ui/");
+            assert!(UI.get_file(rel).is_some(), "manual references a missing screenshot: {img}");
+        }
+        // … and every shipped screenshot is used
+        for f in UI.get_dir("help/img").expect("ui/help/img").files() {
+            let name = f.path().file_name().unwrap().to_string_lossy().to_string();
+            assert!(images.iter().any(|i| i.ends_with(&name)), "unused screenshot ui/help/img/{name}");
+        }
+        // every in-page link points at an existing heading
+        let headings: Vec<String> = USER_MANUAL.lines().filter(|l| l.starts_with('#')).map(|l| slug(l.trim_start_matches('#').trim())).collect();
+        for link in targets(USER_MANUAL, "#") {
+            assert!(headings.contains(&link[1..].to_string()), "broken link {link} in the user manual");
+        }
+        // chapters that pages link to with their "?" button
+        for anchor in ["collection-runner", "mock-servers", "websocket", "cookies", "settings", "profile-an-llm-provider", "benchmark", "vault-and-credentials", "collections", "variables-and-environments"] {
+            assert!(headings.contains(&anchor.to_string()), "no manual chapter for the help button `{anchor}`");
+        }
+        assert!(targets(USER_MANUAL, "SCRIPTING.md").len() >= 2);
+    }
+
+    #[test]
+    fn help_documents_are_served() {
+        let ws = Workspace::open(Some(std::env::temp_dir().join(format!("rsp-srv-{}", rspostman_core::model::new_id())))).unwrap();
+        let app = App::new(ws.clone());
+        let get = |path: &str| app.handle(Req { method: "GET".into(), path: path.into(), headers: vec![("Host".into(), "127.0.0.1:1".into())], ..Default::default() });
+        let manual = get("/help/user-manual.md");
+        assert_eq!(manual.status, 200);
+        assert!(String::from_utf8_lossy(&manual.body).starts_with("# rsPostman user manual"));
+        assert!(String::from_utf8_lossy(&get("/help/scripting.md").body).contains("pm.expect"));
+        let img = get("/help/img/overview.png");
+        assert_eq!((img.status, &img.body[1..4]), (200, &b"PNG"[..]));
+        assert_eq!(get("/help/img/../../Cargo.toml").status, 400);
+        assert_eq!(get("/help/nope.md").status, 404);
+        std::fs::remove_dir_all(&ws.root).ok();
+    }
 }

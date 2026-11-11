@@ -26,6 +26,7 @@ Sprints/         development log: plan, test report and retrospective per sprint
 * **[User manual](docs/user-manual.md)** – every screen and command, with screenshots. The same
   manual is built into the application: press **F1** or the **?** button (Help Center).
 * [Scripting reference](docs/SCRIPTING.md) – the `pm.*` API for pre-request and test scripts.
+* [Changelog](CHANGELOG.md) and [release notes](docs/releases/v0.2.0.md).
 * `Sprints/` – development log.
 
 ![rsPostman](ui/help/img/overview.png)

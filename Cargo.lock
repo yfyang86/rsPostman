@@ -3640,7 +3640,7 @@ dependencies = [
 
 [[package]]
 name = "rspostman"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "chrono",
@@ -3655,7 +3655,7 @@ dependencies = [
 
 [[package]]
 name = "rspostman-core"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "argon2",
@@ -3684,7 +3684,7 @@ dependencies = [
 
 [[package]]
 name = "rspostman-desktop"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "rspostman-core",
@@ -3695,7 +3695,7 @@ dependencies = [
 
 [[package]]
 name = "rspostman-server"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "chrono",
